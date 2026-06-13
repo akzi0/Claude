@@ -179,6 +179,71 @@ In Phase 2, the proposer picks the value with the highest ballot in the response
 
 **Corollary.** At most one value can ever be chosen (Agreement/Safety holds).
 
+### Flexible Paxos (Howard et al. 2016)
+
+The requirement that every quorum intersect is sufficient for safety, but traditional Paxos uses the *same* quorum size for both Phase 1 and Phase 2. Flexible Paxos relaxes this: you only need Phase 1 quorums and Phase 2 quorums to intersect — they do not have to be majority quorums individually.
+
+**Theorem (Flexible Paxos).** Consensus is safe if and only if every Phase 1 quorum $Q_1$ and every Phase 2 quorum $Q_2$ satisfy $Q_1 \cap Q_2 \neq \emptyset$.
+
+This enables a continuum of configurations:
+
+| Phase 1 quorum | Phase 2 quorum | Interpretation |
+|---|---|---|
+| $n/2 + 1$ (majority) | $n/2 + 1$ (majority) | Classic Paxos |
+| $n$ (all) | $1$ (single node) | Fastest writes, worst recovery |
+| $1$ (single node) | $n$ (all) | Fastest leader election, slowest writes |
+| $\lceil n/3 \rceil + 1$ | $\lceil 2n/3 \rceil$ | Optimized for write-heavy workloads |
+
+**Practical implication.** In a geo-distributed 5-node cluster spanning 3 data centers, you can set Phase 2 quorum = 2 (both nodes in the primary DC) for lowest write latency, and Phase 1 quorum = 4 (requiring nodes from at least 2 DCs) for leader election safety. This trades slow leader elections for fast steady-state writes.
+
+```python
+def flexible_paxos_safety_check(n_nodes: int,
+                                 phase1_quorum: int,
+                                 phase2_quorum: int) -> dict:
+    """
+    Check whether a Flexible Paxos configuration is safe.
+    The necessary and sufficient condition: phase1_quorum + phase2_quorum > n_nodes
+    (ensures any Phase 1 quorum intersects any Phase 2 quorum).
+    """
+    intersects = phase1_quorum + phase2_quorum > n_nodes
+    max_failures_p1 = n_nodes - phase1_quorum
+    max_failures_p2 = n_nodes - phase2_quorum
+
+    return {
+        'safe': intersects,
+        'n': n_nodes,
+        'q1': phase1_quorum,
+        'q2': phase2_quorum,
+        'phase1_fault_tolerance': max_failures_p1,
+        'phase2_fault_tolerance': max_failures_p2,
+        'notes': (
+            'SAFE: Q1 ∩ Q2 guaranteed non-empty'
+            if intersects else
+            f'UNSAFE: Q1({phase1_quorum}) + Q2({phase2_quorum}) = '
+            f'{phase1_quorum + phase2_quorum} ≤ {n_nodes}'
+        )
+    }
+
+
+def print_flexible_paxos_tradeoffs():
+    n = 5
+    configs = [
+        (3, 3, "Classic majority"),
+        (5, 1, "Phase2=1: fastest writes, leader election needs all"),
+        (2, 4, "Phase2=4: slowest writes, very fast leader change"),
+        (4, 2, "Phase2=2: fast writes (2 nearby nodes), slow leader election"),
+        (2, 3, "UNSAFE: 2+3=5 not > 5"),
+    ]
+    print(f"\n=== Flexible Paxos Configurations (n={n}) ===\n")
+    for q1, q2, desc in configs:
+        r = flexible_paxos_safety_check(n, q1, q2)
+        status = "✓" if r['safe'] else "✗"
+        print(f"{status} {desc}")
+        print(f"  Q1={q1} (tolerates {r['phase1_fault_tolerance']} failures for election)")
+        print(f"  Q2={q2} (tolerates {r['phase2_fault_tolerance']} failures for writes)")
+        print(f"  {r['notes']}\n")
+```
+
 ### Multi-Paxos
 
 Single-decree Paxos agrees on one value. Multi-Paxos extends it to an ordered log of values (a replicated state machine):
@@ -417,6 +482,53 @@ The fix: leaders only commit entries from *their own term*. Older entries are co
 **Theorem.** If a log entry is committed in term $t$, every leader elected in terms $> t$ contains that entry.
 
 **Proof.** An entry is committed when a majority $Q$ has it. A leader in term $t' > t$ won votes from majority $Q'$. Since $Q \cap Q' \neq \emptyset$, some voter $v$ had the committed entry and voted for the new leader. By the Election Restriction, the new leader's log is at least as up-to-date as $v$'s. Since the committed entry is in $v$'s log and the leader's log is at least as up-to-date, the leader has the committed entry. ∎
+
+### Leader Completeness: Closing the Proof Gap
+
+The proof of Leader Completeness above has a subtle gap that the original paper glosses over. Let us close it rigorously.
+
+**The gap.** We claimed: "the leader's log is at least as up-to-date as $v$'s, and since the committed entry is in $v$'s log, the leader has the committed entry." But "at least as up-to-date" compares only the *last* entry. What if the leader's log is longer but has a different entry at the committed index?
+
+**Closing the gap with Log Matching.** Let the committed entry be at index $i$ with term $t$. Voter $v$ has this entry at index $i$. The new leader won, so its log is at least as up-to-date as $v$'s: either `lastLogTerm_leader > lastLogTerm_v` or they are equal and `lastLogIndex_leader >= lastLogIndex_v`.
+
+Case 1: `lastLogTerm_leader > t`. The leader has an entry with term `lastLogTerm_leader > t` at some index $j$. The leader cannot have invented this entry — some quorum $Q''$ accepted it (leaders only append entries from Phase 2). By the Paxos safety invariant applied to Raft: entries at index $j$ with term $>t$ can only be created after the committed entry at index $i$ (earlier terms cannot overwrite committed entries). But wait — the leader could have entries at index $i$ with a term $\neq t$. Does Log Matching help?
+
+Log Matching says: if two logs share `(index, term)`, all preceding entries match. But if the leader's entry at index $i$ has a *different* term from the committed entry's term $t$, Log Matching does not apply directly.
+
+Here is the resolution. The committed entry was accepted by a quorum $Q$ in term $t$ at index $i$. Any log that contains an entry at `(index=i, term=t')` with $t' \neq t$ was created by a leader in term $t'$. If $t' < t$: this leader came before the committing leader, so it cannot have overwritten an entry committed in a later term (committed entries are never overwritten — that's what we're proving). Circular? No: we prove it by strong induction on the term of the committed entry.
+
+**Formal proof by strong induction on term $t$:**
+
+- **Base case** $t=1$: If an entry is committed in term 1, the first leader (term 1) replicated it to a majority. No entry with term 0 exists (terms start at 1). The first election winner has an empty log or only term-1 entries. Any future leader must have received votes from majority $Q'$. Since $|Q| \cap |Q'| \geq 1$, the voter has the committed entry. The election restriction ensures the new leader's log is at least as long with at least the same last term (term 1). By Log Matching, the new leader has the same entries through the committed index.
+
+- **Inductive step**: Assume all entries committed in terms $1, ..., t-1$ are preserved by all future leaders. Consider an entry committed in term $t$ at index $i$. The committing leader (call it $L$) replicated this to quorum $Q$ and committed it. Any future leader $L'$ (term $t'>t$) wins votes from quorum $Q'$. By quorum intersection, some voter $v \in Q \cap Q'$ has the committed entry at index $i$, term $t$. The election restriction ensures $L'$ has `(lastLogTerm, lastLogIndex) >= v's (lastLogTerm, lastLogIndex)`. Since $v$'s last log entry is at least at index $i$ with term $t$, $L'$'s last entry has term $\geq t$. If $L'$'s entry at index $i$ has term $t$ → Log Matching gives us exactly what we need. If $L'$'s entry at index $i$ has term $t'' > t$ → $t''$ was created by a leader in term $t''$. This leader ran after term $t$ (since terms are monotone). By the inductive hypothesis, that leader's log also contained the committed entry at index $i$, term $t$. But then it created an entry at index $i$ with a *different* term $t''$ — which contradicts the leader's rule of never rewriting entries (leaders only append). **Contradiction**. So $L'$'s entry at index $i$ must have term $t$. By Log Matching, all entries through index $i$ match $L$'s. ∎
+
+### Single-Node Raft and the No-Op Entry
+
+When a Raft leader is elected, it does not immediately know what is committed. Consider: the previous leader committed entry $e$ to 3/5 nodes and crashed. The new leader has $e$ in its log. But `commitIndex` on the new leader reflects only what *it* has applied. The new leader cannot safely serve reads referencing $e$ until it commits something in *its own term*.
+
+**The no-op entry.** Immediately upon election, a Raft leader appends a no-op entry (an empty command) at the current term and replicates it. When this commits, the leader knows its log is fully up-to-date, and all entries from previous terms are also committed (via Log Matching). Only then does it begin serving reads.
+
+This is why you should always see a no-op commit in Raft traces right after an election:
+
+```python
+def _become_leader(self):
+    self.state = State.LEADER
+    self.leader_id = self.node_id
+    # Initialize nextIndex and matchIndex
+    for peer in self.peers:
+        self.next_index[peer.node_id] = len(self.log)
+        self.match_index[peer.node_id] = -1
+    # Append no-op to commit any uncommitted entries from previous terms
+    noop = LogEntry(term=self.current_term, command='NO-OP')
+    self.log.append(noop)
+    self.logger.info(
+        f"Became LEADER term={self.current_term}, appended no-op at "
+        f"index={len(self.log)-1}"
+    )
+```
+
+Without the no-op, a newly elected leader serving read-index reads would correctly confirm leadership via heartbeat but would not know which prior-term entries are committed. The no-op drives this to convergence in one consensus round.
 
 ### Cluster Membership Changes
 
