@@ -1844,7 +1844,246 @@ This is the design working as intended: committed entries are durable across lea
 
 ---
 
-## 9. Consistency Models Deep Dive
+## 9. Testing Distributed Consensus
+
+Distributed systems are notoriously difficult to test because the bugs live in rare interleavings of concurrent events. Standard unit tests cannot exercise them. This section covers the methodology used to find real bugs in production systems.
+
+### Fault Injection Framework
+
+```python
+import random
+import functools
+from typing import Callable, Any
+from enum import Enum
+
+class FaultType(Enum):
+    MESSAGE_DROP    = 'drop'
+    MESSAGE_DELAY   = 'delay'
+    NODE_CRASH      = 'crash'
+    NODE_RESTART    = 'restart'
+    PARTITION       = 'partition'
+    CLOCK_JUMP      = 'clock_jump'
+    DISK_SLOW       = 'disk_slow'
+
+@dataclass
+class FaultSpec:
+    fault_type: FaultType
+    probability: float       # 0.0 to 1.0
+    duration_ms: float = 0   # for delay/partition/slow
+    target_node: Optional[int] = None  # None = any node
+    target_peer: Optional[int] = None  # for partition/directed faults
+
+class FaultInjector:
+    """
+    Wraps a RaftNode cluster and randomly injects faults according to a
+    schedule. This is the core of model-based testing for consensus systems.
+    """
+    def __init__(self, nodes: List[RaftNode], faults: List[FaultSpec],
+                 seed: int = 42):
+        self.nodes = nodes
+        self.faults = faults
+        self.rng = random.Random(seed)
+        self._active_partitions: Set[Tuple[int, int]] = set()
+        self._crashed: Set[int] = set()
+
+    def step(self):
+        """Apply one random fault from the fault schedule."""
+        for spec in self.faults:
+            if self.rng.random() < spec.probability:
+                self._apply_fault(spec)
+
+    def _apply_fault(self, spec: FaultSpec):
+        target = (spec.target_node if spec.target_node is not None
+                  else self.rng.randint(0, len(self.nodes) - 1))
+        node = self.nodes[target]
+
+        if spec.fault_type == FaultType.PARTITION:
+            peer = (spec.target_peer if spec.target_peer is not None
+                    else self.rng.randint(0, len(self.nodes) - 1))
+            if peer != target:
+                node.partitioned_from.add(peer)
+                self.nodes[peer].partitioned_from.add(target)
+                print(f"FAULT: Partition {target} ↔ {peer}")
+
+        elif spec.fault_type == FaultType.NODE_CRASH:
+            self._crashed.add(target)
+            node.partitioned_from = set(range(len(self.nodes))) - {target}
+            print(f"FAULT: Crash node {target}")
+
+        elif spec.fault_type == FaultType.NODE_RESTART:
+            if target in self._crashed:
+                node.partitioned_from = set()
+                self._crashed.discard(target)
+                print(f"FAULT: Restart node {target}")
+
+    def heal_all(self):
+        for node in self.nodes:
+            node.partitioned_from = set()
+        self._crashed.clear()
+
+
+class LinearizabilityChecker:
+    """
+    Simplified Knossos-style linearizability checker for a KV store.
+    
+    Records a history of operations (invocations and responses), then
+    checks whether any linearization of those operations exists that is
+    consistent with sequential KV store semantics.
+    
+    Full Knossos uses WGL (Wing-Gong-Lamport) algorithm; this is a 
+    simplified version for educational purposes.
+    """
+
+    @dataclass
+    class Op:
+        kind: str           # 'write' or 'read'
+        key: str
+        value: Optional[str]
+        invoke_time: float
+        return_time: float
+        result: Optional[str]  # for reads: the value returned
+
+    def __init__(self):
+        self.history: List['LinearizabilityChecker.Op'] = []
+
+    def record_write(self, key: str, value: str,
+                     invoke_t: float, return_t: float):
+        self.history.append(self.Op('write', key, value, invoke_t, return_t, None))
+
+    def record_read(self, key: str, invoke_t: float, return_t: float,
+                    result: Optional[str]):
+        self.history.append(self.Op('read', key, None, invoke_t, return_t, result))
+
+    def check(self) -> Tuple[bool, Optional[str]]:
+        """
+        Check linearizability by trying all valid linearization orderings.
+        An op A can be ordered before op B if A.return_time <= B.invoke_time
+        (real-time order) or they overlap (concurrent, any order valid).
+        
+        This brute-force approach is O(n!) in operation count — use
+        only for small histories. Production checkers use smarter 
+        state-space search (Porcupine in Go, Knossos in Clojure).
+        """
+        from itertools import permutations
+
+        ops = sorted(self.history, key=lambda o: o.invoke_time)
+
+        def valid_order(perm) -> bool:
+            """Check if a permutation of ops is a valid linearization."""
+            # Check real-time ordering constraint
+            for i in range(len(perm)):
+                for j in range(i + 1, len(perm)):
+                    # perm[i] must come before perm[j] in linearization
+                    # This is valid only if perm[i].return_time <= perm[j].invoke_time
+                    # (otherwise they overlap and any order is OK)
+                    if perm[j].return_time < perm[i].invoke_time:
+                        return False  # perm[j] strictly before perm[i] in real time
+
+            # Simulate the KV store against this ordering
+            state: Dict[str, Optional[str]] = {}
+            for op in perm:
+                if op.kind == 'write':
+                    state[op.key] = op.value
+                elif op.kind == 'read':
+                    expected = state.get(op.key)
+                    if op.result != expected:
+                        return False
+            return True
+
+        if len(ops) > 8:
+            return False, "History too large for brute-force check (use Porcupine)"
+
+        for perm in permutations(ops):
+            if valid_order(perm):
+                return True, None
+
+        # Find the first violating read to produce a useful error message
+        for op in ops:
+            if op.kind == 'read':
+                return False, (
+                    f"Linearizability violation: read({op.key}) returned "
+                    f"{op.result!r} at [{op.invoke_time:.3f}, {op.return_time:.3f}]"
+                )
+        return False, "Linearizability violated (no valid linearization found)"
+
+
+def run_fault_injection_test():
+    """
+    Integration test: 5-node cluster under random faults.
+    Records all client operations, then checks linearizability.
+    """
+    print("\n=== Fault Injection + Linearizability Test ===\n")
+
+    nodes: List[RaftNode] = [RaftNode.__new__(RaftNode) for _ in range(5)]
+    for i, node in enumerate(nodes):
+        node.__init__(i, [n for n in nodes if n is not node])
+
+    checker = LinearizabilityChecker()
+
+    fault_schedule = [
+        FaultSpec(FaultType.PARTITION, probability=0.05),
+        FaultSpec(FaultType.NODE_CRASH, probability=0.02),
+        FaultSpec(FaultType.NODE_RESTART, probability=0.03),
+    ]
+    injector = FaultInjector(nodes, fault_schedule, seed=12345)
+
+    # Wait for initial election
+    time.sleep(0.5)
+
+    kv_store_truth = {}  # what we expect (from leader's perspective)
+    n_ops = 0
+
+    for iteration in range(30):
+        time.sleep(0.05)
+        injector.step()
+
+        # Find current leader
+        leader = next((n for n in nodes if n.status()['state'] == 'leader'), None)
+        if leader is None:
+            continue
+
+        # Submit a write
+        key, value = 'x', f'v{iteration}'
+        t0 = time.time()
+        success = leader.client_request(f'SET {key}={value}')
+        t1 = time.time()
+
+        if success:
+            checker.record_write(key, value, t0, t1)
+            n_ops += 1
+
+    injector.heal_all()
+    time.sleep(0.3)
+
+    ok, err = checker.check()
+    print(f"Operations recorded: {n_ops}")
+    print(f"Linearizability check: {'PASS' if ok else 'FAIL'}")
+    if err:
+        print(f"Error: {err}")
+```
+
+### Jepsen Methodology
+
+Jepsen (Kyle Kingsbury, 2013–present) is a framework for testing distributed systems by running real clusters under network partitions and checking operation histories for consistency violations. It has found bugs in:
+
+- **etcd** (stale reads during leader elections before read-index was implemented)
+- **Cassandra** (lost acknowledged writes under partition)
+- **MongoDB** (rollback of acknowledged writes)
+- **CockroachDB** (serializable isolation violations)
+- **Zookeeper** (stale reads from followers)
+
+**Jepsen's approach:**
+1. Start a real cluster (5 nodes, Docker or VMs)
+2. Run client operations (reads and writes) concurrently from multiple threads
+3. Inject network partitions via `iptables` or `tc netem` at random
+4. Record the complete history of invocations and responses with real timestamps
+5. Run Knossos (a model checker) against the history to verify linearizability
+
+**Key insight.** The checker does not need to know *why* an operation returned a value — it only checks whether *some* sequential history exists that is consistent with the operation semantics. A system passes Jepsen if no violation is found in 1M+ operations under aggressive faults. A single violation (e.g., a read returning a value that was never written, or a stale read after a write was acknowledged) constitutes a linearizability bug.
+
+---
+
+## 10. Consistency Models Deep Dive
 
 Consensus algorithms exist to enforce consistency guarantees. But "consistency" is not a single property — there is a strict hierarchy of models, and choosing the wrong one leads to subtle correctness bugs.
 
