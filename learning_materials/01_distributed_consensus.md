@@ -2717,6 +2717,124 @@ class SnapshotManager:
 
 ---
 
+## 14. Common Interview Questions — Rigorous Answers
+
+These are questions asked at systems engineering interviews at companies running large-scale distributed databases. Shallow answers fail; the expected depth is approximately what is covered in this document.
+
+---
+
+**Q1. Can two Raft leaders exist simultaneously?**
+
+**A.** Two leaders *from different terms* can coexist transiently — one is stale and does not know it is deposed. Safety is preserved because the stale leader cannot commit anything: it needs a majority quorum to commit, and the new leader has already won a majority that will reject the stale leader's AppendEntries (their terms are higher). The stale leader's entries are uncommitted and will be overwritten when it receives the new leader's messages.
+
+Two leaders *in the same term* are impossible. A leader requires a majority vote (more than half of nodes). If node A is leader in term $t$, it received votes from majority $Q_A$. For node B to also become leader in term $t$, it needs votes from majority $Q_B$. Since $|Q_A| + |Q_B| > N$, they must share at least one voter. That voter can only vote once per term (enforced by persisted `votedFor`). Contradiction — B cannot get a majority without the voter who already voted for A.
+
+---
+
+**Q2. Why does Raft's commitment rule say "only commit entries from the current term"? Give the exact failure scenario if you violate this.**
+
+**A.** This is Figure 8 from the Ongaro dissertation. The failure scenario:
+
+```
+Timeline (5 nodes: S1-S5):
+Term 1: S1 is leader. Replicates (1,a) to S1,S2,S3. Committed.
+Term 2: S1 is leader. Appends (2,b) to S1, S2. Crashes.
+Term 3: S5 is leader (voted by S3,S4,S5 whose logs show only (1,a)).
+         S5 appends (3,c) to S5 only. Crashes.
+Term 4: S1 recovers. S1 is leader (voted by S1,S2,S3 — S2 has (2,b)).
+         S1 replicates (2,b) to S3. Now S1,S2,S3 have (2,b).
+         **If S1 now commits (2,b) directly:**
+         S1 then crashes. S5 wins election (term 5) because:
+           S5's log = [(1,a), (3,c)] — lastLogTerm=3 > S3's lastLogTerm=2
+           S5 beats S3 and S4, becomes leader.
+           S5 overwrites (2,b) with (3,c) at index 2.
+         Now (2,b) was "committed" (S1 told clients) but is gone. SAFETY VIOLATED.
+
+Fix: S1 must first replicate a term-4 entry (e.g., a no-op) to a majority.
+     Once the no-op is committed, (2,b) is committed transitively via Log Matching.
+     S5 cannot win any future election because term-4 entries on S1,S2,S3 
+     make their logs more up-to-date than S5's (3,c).
+```
+
+---
+
+**Q3. What is the minimum number of nodes needed to tolerate 2 simultaneous failures in Raft? In PBFT?**
+
+**A.**  
+- **Raft (crash fault tolerance):** Need $2f+1$ nodes. For $f=2$: **5 nodes**.
+- **PBFT (Byzantine fault tolerance):** Need $3f+1$ nodes. For $f=2$: **7 nodes**.
+
+The extra node in BFT accounts for the fact that a Byzantine faulty node actively lies. In a $3f+1$ system with quorum size $2f+1$: any two quorums share at least $f+1$ nodes, of which at most $f$ are Byzantine, so at least 1 honest node is in every quorum intersection.
+
+---
+
+**Q4. You observe that your etcd cluster has "high tail latency on writes during leader elections." What are the root causes and how do you fix each?**
+
+**A.** Three root causes:
+
+1. **Election timeout fires unnecessarily.** Symptom: P99 write latency spikes every ~150–300ms. Cause: a follower's heartbeat timer fires before the leader's heartbeat arrives. Fix: tune `heartbeat-interval` to be well below `election-timeout` (ratio ≥ 5:1). etcd defaults to 100ms heartbeat, 1000ms election timeout.
+
+2. **Stale leader serving reads during election.** If using lease-based reads, the old leader may serve stale data while the election is ongoing. Fix: switch to read-index reads, or reduce lease duration so it expires before the new leader is established.
+
+3. **Log catch-up after election.** New leader sends AppendEntries to bring followers up-to-date. If followers are far behind (due to previous crash or slow disk), catch-up takes many round trips. Fix: ensure `max_inflight_msgs` is high enough to pipeline catch-up (default 256 in etcd); use snapshot transfer for very lagged followers.
+
+4. **No-op commit latency.** Every new leader appends a no-op and must commit it before serving reads. This adds one consensus round (typically 2× RTT) to every leadership change. Fix: you cannot eliminate this, but you can minimize by placing all nodes in the same AZ (low RTT).
+
+---
+
+**Q5. Explain why you cannot implement a distributed lock using a single Redis instance and what you need instead.**
+
+**A.** A single Redis instance is a single point of failure and has no consensus mechanism. Specifically:
+
+1. **No quorum.** If the Redis master crashes, a replica may be promoted. The replica may not have the latest keys (async replication → lost writes). A client that acquired a lock on the old master believes it holds the lock; a second client acquires the same lock on the new master. **Split-brain on the lock.**
+
+2. **Expiry-clock drift.** Redis uses local clock for TTL expiry. If the Redis host's clock jumps forward (NTP correction, VM migration), locks expire prematurely. If it jumps backward, locks live longer than intended.
+
+**Correct alternatives:**
+- **Redlock (Redis cluster):** Acquire lock on $\lceil N/2 \rceil$ independent Redis instances. But Redlock is still debated (see Martin Kleppmann's "How to do distributed locking") — it does not handle GC pauses and clock skew correctly.
+- **etcd leases:** Backed by Raft consensus. A lease is a Raft-committed object; its TTL is enforced by the etcd cluster, not a single process. Use `KeepAlive` RPCs to renew. If the client dies, the lease expires and the key is deleted — guaranteed, even if one etcd node crashes.
+- **Zookeeper ephemeral nodes:** Ephemeral znodes are deleted when the client session expires, which is enforced by the ZAB consensus layer.
+
+---
+
+**Q6. A 3-node Raft cluster has nodes A (leader), B, C. A and B have committed entry (5, "SET x=1"). C has not received it. B and C are partitioned from A. What happens?**
+
+**A.** Step by step:
+
+1. A is leader (term 5). Entry `(5, "SET x=1")` is committed on A and B (majority quorum of 3 = 2).
+2. Partition: B and C cannot reach A.
+3. B and C do not receive heartbeats from A. Their election timers fire.
+4. **Who can win the election?** B has the committed entry at term 5. C does not. B's `lastLogTerm=5`, C's `lastLogTerm < 5`. For C to vote for itself, B must grant a vote — but B will check C's `lastLogTerm`: if C's is less than 5, B rejects. C cannot win.
+5. B wins the election (C votes for B since B's log is at least as up-to-date as C's). B becomes leader at term 6.
+6. B replicates `(5, "SET x=1")` to C (via AppendEntries). C catches up.
+7. B appends a no-op `(6, "NO-OP")` and commits it. Commit index on B and C advances.
+8. Partition heals. A receives B's heartbeat (term 6 > 5). A steps down to follower.
+9. A receives AppendEntries from B. A already has `(5, "SET x=1")` — Log Matching confirms it matches. A gets the no-op. All three nodes converge.
+
+**The committed entry `(5, "SET x=1")` is preserved.** Safety holds.
+
+---
+
+**Q7. What is Linearizability and how does it differ from Serializability?**
+
+**A.** These are frequently conflated.
+
+**Linearizability** (Herlihy & Wing 1990): A property of *individual operations* on a single object. An operation appears to execute atomically at some instant between its invocation and response, consistent with real-time order. It is a *single-object* property about ordering in time.
+
+**Serializability** (database theory): A property of *transactions* across *multiple objects*. A schedule of transactions is serializable if it is equivalent to some serial execution of those transactions. It makes no guarantee about real-time ordering — two transactions could execute "out of order" relative to wall clock as long as some serial order exists.
+
+**Strict serializability = Linearizability + Serializability**: transactions appear to execute in real-time order AND as if one at a time. This is what Spanner provides via TrueTime.
+
+**Example of the gap:**
+- Session A: writes `x=1` at 10:00:00, then reads `y` at 10:00:01.
+- Session B: writes `y=1` at 10:00:00.5, then reads `x` at 10:00:01.
+
+A serializable database might order these as: [B writes y, A writes x, B reads x=1, A reads y=1] — consistent, serializable, but not with real-time order (B reads x before A wrote it in this serial order, even though A's write completed before B's read in wall clock time). Strict serializability would require B to see A's write.
+
+Raft provides **linearizability** for individual key reads/writes (when using read-index). Transactions across multiple keys require an additional protocol (2PC, as in CockroachDB) to achieve serializability.
+
+---
+
 ## Summary and Further Reading
 
 Distributed consensus is not a solved problem in practice. The theory (FLP, quorum intersection, Leader Completeness) is tight and beautiful. The engineering gaps are where systems actually fail: missed fsyncs, clock skew under lease reads, term inflation in partitioned networks, membership change bugs.
