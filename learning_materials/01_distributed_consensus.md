@@ -804,6 +804,213 @@ if __name__ == '__main__':
     simulate_cluster()
 ```
 
+### Extended Simulation: Partition Recovery and Log Divergence
+
+The following extends the cluster simulation to demonstrate partition, divergence, and recovery — the most educational scenario in Raft.
+
+```python
+def simulate_partition_and_recovery():
+    """
+    5-node cluster. Shows:
+    1. Leader election
+    2. Network partition {0,1} | {2,3,4}
+    3. New leader elected in majority partition
+    4. Writes committed on new leader
+    5. Partition heals
+    6. Old leader's uncommitted entries overwritten
+    7. Log convergence verified
+    """
+    print("\n" + "="*65)
+    print("RAFT PARTITION + RECOVERY SIMULATION: 5 nodes")
+    print("="*65)
+
+    # Bootstrap 5 nodes
+    nodes: List[RaftNode] = [RaftNode.__new__(RaftNode) for _ in range(5)]
+    for i, node in enumerate(nodes):
+        node.__init__(i, [n for n in nodes if n is not node])
+
+    def get_leader() -> Optional[RaftNode]:
+        for n in nodes:
+            if n.status()['state'] == 'leader':
+                return n
+        return None
+
+    def print_cluster_state(label: str):
+        print(f"\n  [{label}]")
+        print(f"  {'Node':<6} {'State':<12} {'Term':<6} {'CmtIdx':<8} {'Log'}")
+        print(f"  " + "-"*62)
+        for n in nodes:
+            s = n.status()
+            print(f"  {s['node_id']:<6} {s['state']:<12} {s['term']:<6} "
+                  f"{s['commit_index']:<8} {s['log']}")
+
+    # Phase 1: Wait for initial election
+    print("\n[Phase 1] Initial election...")
+    for _ in range(60):
+        time.sleep(0.1)
+        if get_leader():
+            break
+    leader = get_leader()
+    assert leader, "No leader elected"
+    print(f"  Leader: Node {leader.node_id} (term {leader.status()['term']})")
+
+    # Submit 3 commands before partition
+    for cmd in ['SET a=1', 'SET b=2', 'SET c=3']:
+        leader.client_request(cmd)
+    time.sleep(0.4)
+    print_cluster_state("Before partition")
+
+    # Phase 2: Create partition {old_leader, one_follower} | {rest}
+    minority = [leader.node_id, (leader.node_id + 1) % 5]
+    majority = [i for i in range(5) if i not in minority]
+    print(f"\n[Phase 2] Partitioning: minority={minority}, majority={majority}")
+
+    # Each node in minority cannot reach majority and vice versa
+    for nid in minority:
+        for mid in majority:
+            nodes[nid].partitioned_from.add(mid)
+            nodes[mid].partitioned_from.add(nid)
+
+    # Old leader tries to write — will NOT commit (no majority)
+    for cmd in ['SET x=LOST', 'SET y=LOST']:
+        leader.client_request(cmd)
+
+    # Wait for new leader in majority partition
+    time.sleep(1.5)
+    new_leader = None
+    for n in nodes:
+        s = n.status()
+        if s['state'] == 'leader' and s['node_id'] not in minority:
+            new_leader = n
+            break
+    assert new_leader, "No new leader in majority partition"
+    print(f"  New leader: Node {new_leader.node_id} (term {new_leader.status()['term']})")
+
+    # New leader commits entries
+    for cmd in ['SET p=committed', 'SET q=committed', 'SET r=committed']:
+        new_leader.client_request(cmd)
+    time.sleep(0.6)
+    print_cluster_state("During partition (after new leader commits)")
+
+    # Phase 3: Heal partition
+    print(f"\n[Phase 3] Healing partition...")
+    for nid in minority:
+        for mid in majority:
+            nodes[nid].partitioned_from.discard(mid)
+            nodes[mid].partitioned_from.discard(nid)
+
+    time.sleep(1.0)
+    print_cluster_state("After partition healed")
+
+    # Verify convergence
+    logs = [tuple(str(e) for e in n.status()['log']) for n in nodes]
+    commits = [n.status()['commit_index'] for n in nodes]
+    converged = len(set(logs)) == 1
+    print(f"\n  Logs converged: {converged}")
+    print(f"  Commit indices: {commits}")
+
+    # Verify the 'LOST' entries are gone
+    final_log = nodes[0].status()['log']
+    lost = any('LOST' in e.command for e in final_log)
+    print(f"  'LOST' entries in final log: {lost} (should be False)")
+
+
+if __name__ == '__main__':
+    simulate_cluster()
+    simulate_partition_and_recovery()
+```
+
+### Log Compaction: Snapshot Implementation
+
+```python
+import json
+import io
+
+@dataclass 
+class SnapshotData:
+    last_included_index: int
+    last_included_term: int
+    state_machine: dict  # the actual KV store state
+
+class SnapshotRaftNode(RaftNode):
+    """
+    Extends RaftNode with snapshot support.
+    Demonstrates InstallSnapshot RPC (§7 of the Raft paper).
+    """
+    SNAPSHOT_THRESHOLD = 5  # take snapshot every 5 applied entries
+
+    def __init__(self, node_id: int, peers: List['RaftNode']):
+        super().__init__(node_id, peers)
+        self.state_machine: Dict[str, str] = {}  # KV store
+        self.last_snapshot: Optional[SnapshotData] = None
+        self.snapshot_index: int = -1
+        self.snapshot_term: int = -1
+
+    def _apply_entry(self, entry: LogEntry):
+        """Apply a committed log entry to the state machine."""
+        # Parse simple "SET key=value" or "DEL key" commands
+        if entry.command.startswith("SET "):
+            parts = entry.command[4:].split("=", 1)
+            if len(parts) == 2:
+                self.state_machine[parts[0]] = parts[1]
+        elif entry.command.startswith("DEL "):
+            self.state_machine.pop(entry.command[4:], None)
+
+    def maybe_take_snapshot(self):
+        applied = self.commit_index
+        since_last = applied - self.snapshot_index
+        if since_last >= self.SNAPSHOT_THRESHOLD and applied >= 0:
+            self._take_snapshot(applied)
+
+    def _take_snapshot(self, up_to_index: int):
+        with self._lock:
+            if up_to_index >= len(self.log):
+                return
+            snap = SnapshotData(
+                last_included_index=up_to_index,
+                last_included_term=self.log[up_to_index].term,
+                state_machine=dict(self.state_machine)
+            )
+            # Discard log entries up to snapshot (keep remainder)
+            self.log = self.log[up_to_index + 1:]
+            self.last_snapshot = snap
+            self.snapshot_index = up_to_index
+            self.snapshot_term = snap.last_included_term
+            self.logger.info(
+                f"Snapshot taken at index={up_to_index}, "
+                f"state={snap.state_machine}, "
+                f"remaining_log={self.log}"
+            )
+
+    def install_snapshot(self, snap: SnapshotData) -> bool:
+        """
+        Called when leader sends InstallSnapshot RPC.
+        This node is so far behind that the leader has discarded 
+        the log entries the node needs.
+        """
+        with self._lock:
+            if snap.last_included_index <= self.snapshot_index:
+                return False  # already have a newer snapshot
+            # Reset log: discard everything up to snap.last_included_index
+            if (snap.last_included_index < len(self.log) and
+                    self.log[snap.last_included_index].term == snap.last_included_term):
+                # Keep log entries after the snapshot
+                self.log = self.log[snap.last_included_index + 1:]
+            else:
+                self.log = []
+            self.state_machine = dict(snap.state_machine)
+            self.last_snapshot = snap
+            self.snapshot_index = snap.last_included_index
+            self.snapshot_term = snap.last_included_term
+            self.commit_index = snap.last_included_index
+            self.last_applied = snap.last_included_index
+            self.logger.info(
+                f"Installed snapshot at index={snap.last_included_index}, "
+                f"state={snap.state_machine}"
+            )
+            return True
+```
+
 **Running the simulation** will show output similar to:
 
 ```
