@@ -1377,6 +1377,237 @@ Long-running systems (PostgreSQL, Spanner) must handle identifier wraparound. Po
 
 In distributed consensus, **epoch numbers** (equivalent to Raft terms) can exhaust if stored in 32-bit integers on very busy clusters. Production systems use 64-bit counters. Additionally, ballot numbers in Paxos must be globally unique; typical encoding is `(sequence_number << 8) | node_id`, but this limits node count or sequence length. Epoch transitions must be carefully fenced to prevent old-epoch messages from interfering.
 
+### Clock Skew: Quantifying the Danger
+
+Lease-based reads are safe only if the leader's clock does not drift significantly relative to its followers. Let's quantify exactly when things break.
+
+```python
+import time
+import statistics
+from dataclasses import dataclass
+from typing import List
+
+@dataclass
+class ClockReading:
+    """Simulates what a node believes the current time is."""
+    node_id: int
+    true_time: float    # actual time (ground truth)
+    skew_ms: float      # node's clock is ahead by this many milliseconds
+
+    @property
+    def local_time(self) -> float:
+        return self.true_time + self.skew_ms / 1000.0
+
+
+def analyze_lease_safety(
+    lease_duration_ms: float,
+    clock_skew_ms: float,
+    rtt_ms: float
+) -> dict:
+    """
+    Determines whether a lease of `lease_duration_ms` is safe given
+    known clock skew and network RTT.
+
+    A leader L holds a lease granted at real time T_grant for duration D.
+    L believes it holds the lease until T_grant + D (by L's clock).
+    But if L's clock is AHEAD by `skew_ms`, L's "T_grant + D" in real time
+    is actually T_grant + D - skew_ms.
+
+    Meanwhile, a new leader can be elected after followers stop receiving
+    heartbeats for their election timeout. The minimum time for a new leader
+    to send a heartbeat that reaches followers is:
+      election_timeout + heartbeat_interval + network_rtt
+
+    For safety: lease must expire before new leader can assert leadership.
+    """
+    # Maximum safe lease duration
+    # New leader cannot be elected until at minimum: election_timeout + rtt
+    # But leader's perceived lease end is ahead by skew_ms
+    # So effective lease = lease_duration - clock_skew
+    effective_lease_ms = lease_duration_ms - clock_skew_ms
+
+    # Round trip adds latency to when leader gets confirmation
+    network_overhead_ms = rtt_ms
+
+    # Safe if effective lease is positive AND less than network round trip
+    # (ensures we don't serve reads after leadership is lost)
+    safe = effective_lease_ms > 0 and effective_lease_ms > network_overhead_ms
+
+    return {
+        'lease_duration_ms': lease_duration_ms,
+        'clock_skew_ms': clock_skew_ms,
+        'effective_lease_ms': effective_lease_ms,
+        'network_rtt_ms': rtt_ms,
+        'safe': safe,
+        'recommendation': (
+            'SAFE: lease expires before clock drift causes staleness'
+            if safe else
+            f'UNSAFE: {clock_skew_ms}ms skew eats into {lease_duration_ms}ms lease '
+            f'leaving only {effective_lease_ms:.1f}ms effective window'
+        )
+    }
+
+
+def clock_skew_scenarios():
+    scenarios = [
+        # (lease_ms, skew_ms, rtt_ms, description)
+        (5000, 50,  5,    "etcd default: 5s lease, 50ms NTP skew, 5ms LAN RTT"),
+        (5000, 200, 5,    "Degraded NTP: 200ms skew"),
+        (5000, 5001,5,    "Clock jump (VM live migration): skew > lease"),
+        (1000, 50,  5,    "Short lease (1s): more frequent renewal, less skew risk"),
+        (5000, 50,  4999, "High latency WAN (5s RTT): effective window too small"),
+    ]
+    print("\n=== Clock Skew Safety Analysis for Lease Reads ===\n")
+    for lease, skew, rtt, desc in scenarios:
+        result = analyze_lease_safety(lease, skew, rtt)
+        status = "✓" if result['safe'] else "✗"
+        print(f"{status} {desc}")
+        print(f"  Effective lease: {result['effective_lease_ms']:.0f}ms  "
+              f"→  {result['recommendation']}\n")
+```
+
+**Practical takeaway.** etcd's default lease is 5 seconds with a 500ms heartbeat interval. NTP clock skew is typically <10ms on well-administered hosts, so the effective lease window is ~4.99 seconds — safe. But VM live migration can cause clock jumps of seconds; cloud providers (AWS, GCP) publish guidelines for NTP discipline in VMs that run distributed databases.
+
+### Write-Ahead Log (WAL) Anatomy
+
+Understanding how Raft's durable state is actually persisted on disk is critical. The WAL is not just an append-only file — it must handle partial writes and corruption.
+
+```python
+import struct
+import hashlib
+import os
+from typing import Iterator
+
+# WAL record format:
+# [4 bytes: CRC32] [4 bytes: record_length] [record_length bytes: data]
+# CRC covers the record_length + data fields.
+# This allows detecting partial writes (truncated records on crash).
+
+WAL_MAGIC = b'RAFT'
+WAL_VERSION = 1
+
+@dataclass
+class WALRecord:
+    record_type: int   # 0=entry, 1=hard_state, 2=snapshot_metadata
+    data: bytes
+
+    def encode(self) -> bytes:
+        payload = struct.pack('>B', self.record_type) + self.data
+        length = len(payload)
+        crc = int(hashlib.crc32(struct.pack('>I', length) + payload) & 0xFFFFFFFF)
+        return struct.pack('>II', crc, length) + payload
+
+    @classmethod
+    def decode(cls, buf: bytes, offset: int) -> Tuple['WALRecord', int]:
+        if offset + 8 > len(buf):
+            raise EOFError("Truncated WAL record header")
+        crc, length = struct.unpack('>II', buf[offset:offset+8])
+        if offset + 8 + length > len(buf):
+            raise EOFError(f"Truncated WAL record body at offset {offset}")
+        payload = buf[offset+8:offset+8+length]
+        actual_crc = int(hashlib.crc32(buf[offset+4:offset+8+length]) & 0xFFFFFFFF)
+        if actual_crc != crc:
+            raise ValueError(f"WAL CRC mismatch at offset {offset}: "
+                             f"expected {crc:#010x}, got {actual_crc:#010x}")
+        return cls(record_type=payload[0], data=payload[1:]), offset + 8 + length
+
+
+class WAL:
+    """
+    Crash-safe write-ahead log.
+    Key invariant: data is durable (on disk) BEFORE we respond to any RPC.
+    """
+    def __init__(self, path: str):
+        self.path = path
+        self._fd = open(path, 'ab+')  # append + read
+
+    def append(self, record: WALRecord):
+        encoded = record.encode()
+        self._fd.write(encoded)
+        # CRITICAL: fsync before returning. Without this, a crash can
+        # lose the record even though write() returned successfully
+        # (OS may buffer the write in page cache).
+        self._fd.flush()
+        os.fdatasync(self._fd.fileno())
+
+    def read_all(self) -> Iterator[WALRecord]:
+        """Read all valid records, stopping at first corruption."""
+        with open(self.path, 'rb') as f:
+            buf = f.read()
+        offset = 0
+        while offset < len(buf):
+            try:
+                record, offset = WALRecord.decode(buf, offset)
+                yield record
+            except (EOFError, ValueError) as e:
+                # Truncation at end is normal (crash mid-write).
+                # Corruption in the middle is a bug.
+                print(f"WAL scan stopped at offset {offset}: {e}")
+                break
+
+    def truncate_after(self, valid_offset: int):
+        """Used during recovery to discard partial writes past valid_offset."""
+        self._fd.close()
+        with open(self.path, 'r+b') as f:
+            f.truncate(valid_offset)
+        self._fd = open(self.path, 'ab+')
+```
+
+### Partition Detection Heuristics
+
+Raft's election timeout is the primary partition detector, but production systems add layered heuristics:
+
+```python
+import statistics
+
+class PartitionDetector:
+    """
+    Tracks heartbeat latency to detect asymmetric partitions
+    (where a leader can send but not receive, or vice versa).
+    These are invisible to simple timeout-based detection.
+    """
+    def __init__(self, window_size: int = 20, p99_threshold_ms: float = 50.0):
+        self.window_size = window_size
+        self.threshold_ms = p99_threshold_ms
+        self.latencies: Dict[int, List[float]] = {}  # peer_id -> recent RTTs
+
+    def record_heartbeat_rtt(self, peer_id: int, rtt_ms: float):
+        hist = self.latencies.setdefault(peer_id, [])
+        hist.append(rtt_ms)
+        if len(hist) > self.window_size:
+            hist.pop(0)
+
+    def is_suspicious(self, peer_id: int) -> bool:
+        hist = self.latencies.get(peer_id, [])
+        if len(hist) < 5:
+            return False
+        p99 = sorted(hist)[int(len(hist) * 0.99)]
+        return p99 > self.threshold_ms
+
+    def asymmetric_partition_score(self) -> Dict[int, float]:
+        """
+        Returns a score per peer indicating likelihood of one-way partition.
+        High score = likely asymmetric partition (leader can send but peer
+        cannot receive, or vice versa).
+        This is used by some systems to proactively step down rather than
+        waiting for election timeout to fire.
+        """
+        scores = {}
+        all_p99s = []
+        for peer_id, hist in self.latencies.items():
+            if len(hist) >= 5:
+                p99 = sorted(hist)[int(len(hist) * 0.99)]
+                all_p99s.append(p99)
+        if not all_p99s:
+            return scores
+        median_p99 = statistics.median(all_p99s)
+        for peer_id, hist in self.latencies.items():
+            if len(hist) >= 5:
+                p99 = sorted(hist)[int(len(hist) * 0.99)]
+                scores[peer_id] = p99 / (median_p99 + 0.001)
+        return scores
+```
+
 ---
 
 ## 7. Edge Cases & Failure Modes
