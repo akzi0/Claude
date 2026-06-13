@@ -1038,6 +1038,455 @@ This is the design working as intended: committed entries are durable across lea
 
 ---
 
+## 9. Consistency Models Deep Dive
+
+Consensus algorithms exist to enforce consistency guarantees. But "consistency" is not a single property — there is a strict hierarchy of models, and choosing the wrong one leads to subtle correctness bugs.
+
+### The Consistency Hierarchy
+
+From strongest to weakest:
+
+```
+Linearizability (Herlihy & Wing 1990)
+  ↓
+Sequential Consistency (Lamport 1979)
+  ↓
+Causal Consistency (Ahamad et al. 1995)
+  ↓
+PRAM / Pipeline RAM
+  ↓
+Eventual Consistency (Vogels 2009)
+```
+
+### Linearizability
+
+**Definition.** An execution is linearizable if there exists a total ordering of all operations such that:
+1. The ordering is consistent with the real-time order of non-overlapping operations.
+2. Each operation appears to execute atomically at some point between its invocation and response.
+
+Linearizability is the **gold standard** for distributed systems. It is what clients expect from a single machine: reads see the latest write, and there is a single consistent view of history.
+
+**Example of non-linearizable execution:**
+
+```
+Client A:  write(x=1) ----[returns OK]----
+Client B:               read(x) --[returns 0]--  read(x) --[returns 1]--
+```
+
+If B's first read overlaps with A's write and returns 0, that is fine (concurrent). But if B's second read (entirely after A's write completed) returns 0, that violates linearizability — the write is "missing" from a completed operation's view.
+
+**How Raft provides linearizability.** All writes go through the leader's log. Reads via read-index (or quorum) ensure the leader has applied all committed writes before responding. This linearizes the history at the log's commit order.
+
+### Sequential Consistency
+
+**Definition.** An execution is sequentially consistent if there is a total order of operations that:
+1. Is consistent with each *individual process's* program order.
+2. Each operation appears to execute atomically.
+
+Unlike linearizability, sequential consistency does not require respecting real-time order between different processes. Two clients can observe operations in different orders as long as each client's own operations appear in order.
+
+**Example where sequential consistency holds but linearizability does not:**
+
+```
+Process 1: write(x=1)
+Process 2: write(y=1)
+Process 3: read(y=1), read(x=0)  ← sees y before x
+Process 4: read(x=1), read(y=0)  ← sees x before y
+```
+
+Processes 3 and 4 disagree on the order of writes to x and y. This violates linearizability (there's no single total order consistent with all reads) but satisfies sequential consistency (each process's program order is respected).
+
+CPUs with out-of-order execution and store buffers implement sequential consistency within a core but weaker models (TSO, PSO) across cores — which is why concurrent programs need memory barriers.
+
+### Causal Consistency
+
+**Definition.** If operation A causally precedes operation B (A happened-before B in the Lamport sense), then every process that sees B must also have seen A before B.
+
+Causally related operations are ordered; concurrent operations may be observed in any order.
+
+**Practical implementation.** Vector clocks or version vectors track causal dependencies. MongoDB's causal sessions use cluster time + operationTime to enforce this. Cassandra's lightweight transactions (using Paxos) provide linearizability for specific keys; ordinary reads/writes are only eventually consistent.
+
+```python
+from typing import Dict, List, Tuple
+
+class VectorClock:
+    """Tracks causality for causal consistency enforcement."""
+
+    def __init__(self, node_id: str, all_nodes: List[str]):
+        self.node_id = node_id
+        self.clock: Dict[str, int] = {n: 0 for n in all_nodes}
+
+    def tick(self) -> Dict[str, int]:
+        self.clock[self.node_id] += 1
+        return dict(self.clock)
+
+    def update(self, received: Dict[str, int]):
+        """Merge a received vector clock (happens-before relationship)."""
+        for node, ts in received.items():
+            self.clock[node] = max(self.clock.get(node, 0), ts)
+        self.clock[self.node_id] += 1  # local event triggered by receipt
+
+    def happens_before(self, vc_a: Dict[str, int], vc_b: Dict[str, int]) -> bool:
+        """Returns True if vc_a happened-before vc_b (A causally precedes B)."""
+        return (
+            all(vc_a.get(n, 0) <= vc_b.get(n, 0) for n in set(vc_a) | set(vc_b))
+            and any(vc_a.get(n, 0) < vc_b.get(n, 0) for n in set(vc_a) | set(vc_b))
+        )
+
+    def concurrent(self, vc_a: Dict[str, int], vc_b: Dict[str, int]) -> bool:
+        return (
+            not self.happens_before(vc_a, vc_b)
+            and not self.happens_before(vc_b, vc_a)
+        )
+
+
+def causal_consistency_example():
+    nodes = ['A', 'B', 'C']
+    vc_a = VectorClock('A', nodes)
+    vc_b = VectorClock('B', nodes)
+    vc_c = VectorClock('C', nodes)
+
+    # A writes x=1, gets timestamp t1
+    t1 = vc_a.tick()
+    print(f"A writes x=1 at {t1}")
+
+    # A sends message to B (B learns about A's write causally)
+    vc_b.update(t1)
+    t2 = vc_b.tick()
+    print(f"B writes y=1 (after seeing A's write) at {t2}")
+
+    # C receives B's message — must have seen A's write too
+    vc_c.update(t2)
+    print(f"C's clock after receiving B's message: {vc_c.clock}")
+    print(f"C has seen A's write: {vc_c.clock['A'] >= t1['A']}")
+
+    # Two independent writes are concurrent (no causal order)
+    vc_x = VectorClock('X', nodes)
+    vc_y = VectorClock('Y', nodes)
+    tx = vc_x.tick()
+    ty = vc_y.tick()
+    print(f"\nConcurrent? {vc_a.concurrent(tx, ty)}")  # True
+
+if __name__ == '__main__':
+    causal_consistency_example()
+```
+
+### Eventual Consistency
+
+**Definition.** If no new updates are made, all replicas eventually converge to the same state.
+
+This is the weakest useful model. It makes no guarantee about when convergence occurs or what any individual read returns. Systems like Cassandra (default), DynamoDB, and Riak use eventual consistency for their highest-throughput paths.
+
+**Conflict resolution.** When concurrent writes conflict, the system must pick a winner:
+- **Last Write Wins (LWW):** Use wall clock or Lamport timestamp. Loses data silently.
+- **CRDTs (Conflict-free Replicated Data Types):** Data structures (counters, sets, maps) where all concurrent updates can be merged deterministically. No coordination needed.
+- **Application-level merge:** Client provides a merge function. Used by CouchDB.
+
+### Why This Matters for Consensus
+
+Paxos and Raft provide **linearizability** — the strongest model — which is why they require $2f+1$ nodes and majority quorums. Weaker consistency models (causal, eventual) can be implemented without consensus, with much higher availability and lower latency. The choice is always an engineering tradeoff: use consensus where you need ordering guarantees, and weaker models where you can tolerate staleness.
+
+---
+
+## 10. Consensus in Production Systems
+
+### etcd
+
+etcd is the most widely deployed Raft implementation (it is the backing store for Kubernetes). Key implementation decisions:
+
+**Storage backend.** etcd v3 uses bbolt (a B+tree key-value store) as its persistent storage. Log entries are written to bbolt with `fdatasync` before AppendEntries returns. Snapshots are taken periodically to truncate the log.
+
+**Read index for linearizable reads.** etcd implements the read-index approach: on a read, the leader appends the current `commitIndex`, sends a round of heartbeats to confirm leadership, then waits until `appliedIndex >= savedCommitIndex` before serving the read. This avoids Raft log entries for reads while guaranteeing linearizability.
+
+**Watch mechanism.** etcd v3 provides a server-side watch API: clients subscribe to key ranges and receive a stream of events. Each event carries the revision at which it occurred. This revision is the Raft `commitIndex` at the time the write was applied — a monotonically increasing counter that clients use to resume watches after reconnection without missing events.
+
+**Lease mechanism for distributed locks.** etcd leases are TTL-bounded. A client acquires a lease (attached to a key), keeps it alive by sending KeepAlive RPCs, and if the client dies, the lease expires and the key is deleted. This is the basis of Kubernetes leader election.
+
+### CockroachDB
+
+CockroachDB uses multi-Raft across shards. Each range (64 MB by default) has its own Raft group.
+
+**Transaction protocol.** CockroachDB uses a variant of 2PC (two-phase commit) layered on top of Raft. The transaction coordinator writes intents (provisional values) to the Raft log, then commits by writing a transaction record. Readers that encounter an intent check the transaction record to determine whether to use the intent or the previous value.
+
+**HLC (Hybrid Logical Clocks).** CockroachDB uses HLCs to provide causality guarantees across transactions and ranges. An HLC is `(physical_time, logical_counter)`. Physical time is bounded by NTP; the logical counter breaks ties. This enables reading at a consistent snapshot across all ranges without a global lock manager.
+
+**Follower reads.** CockroachDB v2.0+ supports reading from followers (non-leaders) with a bounded staleness guarantee. The follower knows the leader's `closedTimestamp` — a timestamp before which all writes are committed. Reads with `AS OF SYSTEM TIME` older than `closedTimestamp` can be served locally, reducing tail latency and enabling geo-distributed reads.
+
+### Apache ZooKeeper (ZAB Protocol)
+
+ZooKeeper uses ZAB (ZooKeeper Atomic Broadcast), a protocol similar to but distinct from Paxos.
+
+**Zxid.** Each transaction has a 64-bit zxid = `(epoch, counter)`. Epoch increments on leader change; counter increments on each write. This provides a total order across leader epochs.
+
+**Phase 1 (Discovery/Sync).** New leader discovers the latest committed transaction, syncs all followers to agree on a common prefix, then begins serving writes.
+
+**Phase 2 (Broadcast).** Leader proposes updates (PROPOSAL), followers ACK, leader COMMITs when quorum ACKs. Unlike Paxos, the leader does not need a separate phase to establish its authority per transaction — authority is established once per epoch.
+
+**Key difference from Raft.** ZAB provides "primary order" — a stronger property than Raft's Log Matching. The leader ensures that if it has broadcast a proposal, all future leaders will also have it. This allows followers to serve reads directly (with appropriate fencing) because they are guaranteed to have all committed writes in order.
+
+### Google Spanner
+
+Spanner uses Paxos for each shard (called a "directory"). What makes Spanner unique is its use of TrueTime to provide **external consistency** (a distributed form of linearizability) across shards without a global coordinator.
+
+**TrueTime API.** TrueTime returns `[earliest, latest]` bounds on the current time, guaranteed by GPS receivers and atomic clocks. The uncertainty interval is typically 1–7ms.
+
+**Commit wait.** Before committing a read-write transaction, Spanner waits until `TT.now().earliest > commit_timestamp`. This ensures that the commit timestamp is in the past before the transaction is visible — any subsequent transaction in the real world that reads this data will have a start time strictly after the commit time, preserving external consistency.
+
+**Read-only transactions.** Spanner provides snapshot reads at a specific timestamp. Because TrueTime bounds are known, a read at timestamp $T$ is safe to serve from any replica that has applied all writes up to $T$ — no locks needed, no consensus round trips.
+
+---
+
+## 11. Multi-Raft and Sharding
+
+A single Raft group can handle ~100k operations/second on modern hardware. Real databases need much more. The solution is **multi-Raft**: partition data across many Raft groups, each responsible for a subset of the keyspace.
+
+### Range Partitioning
+
+```python
+from dataclasses import dataclass, field
+from typing import List, Optional, Dict, Tuple
+import bisect
+
+@dataclass
+class Range:
+    """A contiguous key range managed by one Raft group."""
+    start_key: str
+    end_key: str  # exclusive
+    raft_group_id: int
+    leader_node: int
+
+class RangeRouter:
+    """
+    Routes client requests to the correct Raft group based on key.
+    In production (CockroachDB, TiKV), this metadata is itself stored
+    in a Raft group (the 'meta range').
+    """
+    def __init__(self):
+        self.ranges: List[Range] = []
+        self._start_keys: List[str] = []
+
+    def add_range(self, r: Range):
+        idx = bisect.bisect_left(self._start_keys, r.start_key)
+        self.ranges.insert(idx, r)
+        self._start_keys.insert(idx, r.start_key)
+
+    def route(self, key: str) -> Optional[Range]:
+        idx = bisect.bisect_right(self._start_keys, key) - 1
+        if idx < 0:
+            return None
+        r = self.ranges[idx]
+        if r.start_key <= key < r.end_key:
+            return r
+        return None
+
+    def split_range(self, range_id: int, split_key: str) -> Tuple[Range, Range]:
+        """
+        Range split: one Raft group becomes two.
+        The split is itself a Raft-committed operation in the meta range.
+        Steps:
+          1. Leader of old range commits a split intent.
+          2. Left range [start, split_key) retains old group.
+          3. Right range [split_key, end) bootstraps a new Raft group,
+             copying leader's snapshot as initial state.
+          4. Meta range is updated atomically.
+        """
+        r = next(x for x in self.ranges if x.raft_group_id == range_id)
+        left = Range(r.start_key, split_key, r.raft_group_id, r.leader_node)
+        right = Range(split_key, r.end_key, r.raft_group_id + 1000, r.leader_node)
+        self.ranges.remove(r)
+        self._start_keys.remove(r.start_key)
+        self.add_range(left)
+        self.add_range(right)
+        return left, right
+
+
+def demonstrate_routing():
+    router = RangeRouter()
+    router.add_range(Range('a', 'm', raft_group_id=1, leader_node=0))
+    router.add_range(Range('m', 'z', raft_group_id=2, leader_node=3))
+
+    for key in ['apple', 'mango', 'zebra', 'banana']:
+        r = router.route(key)
+        print(f"key={key!r:10} → group={r.raft_group_id if r else None}")
+
+    print("\nSplitting group 1 at 'f'...")
+    left, right = router.split_range(1, 'f')
+    print(f"Left:  [{left.start_key}, {left.end_key})  group={left.raft_group_id}")
+    print(f"Right: [{right.start_key}, {right.end_key})  group={right.raft_group_id}")
+
+    for key in ['apple', 'fig', 'grape']:
+        r = router.route(key)
+        print(f"key={key!r:10} → group={r.raft_group_id if r else None}")
+```
+
+### Cross-Shard Transactions
+
+When a transaction touches multiple Raft groups, you need distributed commit. The standard approach is **2PC (Two-Phase Commit)** with the transaction coordinator being a Raft-replicated state machine itself:
+
+1. **Prepare phase.** Coordinator sends `Prepare(txn_id, writes)` to each involved shard's Raft group. Each shard votes YES (locking the rows) or NO (conflict).
+2. **Commit phase.** If all vote YES, coordinator writes a durable commit record to *its own* Raft group, then sends `Commit(txn_id)` to all shards. Shards apply the writes and release locks.
+
+**Failure modes in 2PC + Raft:**
+- Coordinator crashes after writing commit record but before notifying shards → shards are locked. Recovery: any node can read the coordinator's Raft log, find the committed record, and send the Commit messages. This is called *distributed recovery* and is why the coordinator's state must be Raft-replicated.
+- A shard's Raft group loses quorum mid-transaction → the prepare vote never completes → coordinator times out and aborts. The abort is also Raft-replicated.
+
+---
+
+## 12. Performance & Optimization
+
+### Batching and Pipelining
+
+The naive Raft implementation processes one client request per consensus round. This is catastrophically slow. Production systems batch:
+
+```python
+import queue
+import threading
+import time
+from typing import List, Callable
+from dataclasses import dataclass
+
+@dataclass
+class PendingWrite:
+    command: str
+    callback: Callable[[bool], None]
+
+class BatchingRaftLeader:
+    """
+    Collects client writes for up to `batch_interval_ms` milliseconds,
+    then submits them as a single AppendEntries batch. This amortizes the
+    network RTT across many client requests.
+    """
+    def __init__(self, batch_interval_ms: float = 2.0, max_batch_size: int = 500):
+        self.batch_interval = batch_interval_ms / 1000.0
+        self.max_batch_size = max_batch_size
+        self._pending: List[PendingWrite] = []
+        self._lock = threading.Lock()
+        self._batch_event = threading.Event()
+        self._flush_thread = threading.Thread(target=self._flush_loop, daemon=True)
+        self._flush_thread.start()
+
+    def submit(self, command: str, callback: Callable[[bool], None]):
+        with self._lock:
+            self._pending.append(PendingWrite(command, callback))
+            if len(self._pending) >= self.max_batch_size:
+                self._batch_event.set()
+
+    def _flush_loop(self):
+        while True:
+            self._batch_event.wait(timeout=self.batch_interval)
+            self._batch_event.clear()
+            with self._lock:
+                batch = self._pending[:]
+                self._pending.clear()
+            if batch:
+                self._commit_batch(batch)
+
+    def _commit_batch(self, batch: List[PendingWrite]):
+        # In real implementation: append all commands to log as a single
+        # AppendEntries RPC, wait for quorum, then invoke all callbacks.
+        print(f"Committing batch of {len(batch)} commands: "
+              f"{[w.command for w in batch]}")
+        for write in batch:
+            write.callback(True)
+```
+
+**Throughput impact.** A single Raft round trip over a LAN (1ms RTT) yields ~1,000 ops/sec without batching. With batching 500 commands per round, the same latency yields ~500,000 ops/sec. etcd achieves ~200k writes/sec on typical hardware with batching.
+
+### Log Compaction and Snapshots
+
+Without truncation, the Raft log grows unboundedly. Compaction takes a snapshot of the state machine at index $I$ and deletes log entries $\leq I$.
+
+```python
+@dataclass
+class Snapshot:
+    last_included_index: int
+    last_included_term: int
+    state: dict  # serialized state machine
+
+class SnapshotManager:
+    def __init__(self, snapshot_threshold: int = 10_000):
+        self.threshold = snapshot_threshold
+        self.last_snapshot: Optional[Snapshot] = None
+
+    def should_snapshot(self, log_size: int, last_snapshot_index: int,
+                        applied_index: int) -> bool:
+        entries_since_snapshot = applied_index - last_snapshot_index
+        return entries_since_snapshot >= self.threshold
+
+    def take_snapshot(self, state_machine: dict,
+                      applied_index: int, applied_term: int) -> Snapshot:
+        snap = Snapshot(
+            last_included_index=applied_index,
+            last_included_term=applied_term,
+            state=dict(state_machine)
+        )
+        self.last_snapshot = snap
+        print(f"Snapshot taken at index={applied_index}, "
+              f"state has {len(state_machine)} keys")
+        return snap
+
+    def install_snapshot(self, snap: Snapshot, raft_node) -> bool:
+        """
+        Used when a follower is so far behind that log entries have been
+        discarded. Leader sends InstallSnapshot RPC instead of AppendEntries.
+        Follower must:
+          1. Save snapshot to durable storage (fsync).
+          2. Discard any existing log entries conflicting with snapshot.
+          3. Reset state machine to snapshot state.
+          4. Set commitIndex = lastApplied = snap.last_included_index.
+        """
+        print(f"Installing snapshot from index {snap.last_included_index}")
+        # In production: write to disk before applying to state machine
+        self.last_snapshot = snap
+        return True
+```
+
+### Network Optimizations
+
+**Write coalescing.** Multiple AppendEntries in flight simultaneously (pipelining). The leader does not wait for acknowledgment of batch $k$ before sending batch $k+1$. This keeps the network pipe full.
+
+**Parallel disk writes.** The leader can send AppendEntries to all followers while simultaneously fsyncing to its own disk — these are independent. The commit can proceed as soon as $f$ followers ACK and the leader's fsync completes, whichever comes last.
+
+**Compression.** Log entries for large payloads (e.g., Kubernetes etcd storing pod specs) benefit from LZ4/zstd compression before transmission. etcd 3.5+ compresses snapshots.
+
+**Flow control.** If followers fall behind, the leader must limit in-flight entries to prevent memory exhaustion. etcd uses a `maxInflightMsgs` parameter (default 256) to cap outstanding AppendEntries per follower.
+
+---
+
+## 13. Glossary
+
+| Term | Definition |
+|------|-----------|
+| **Bivalent configuration** | A system state from which both decision values 0 and 1 are still reachable. Key concept in FLP proof. |
+| **Ballot / Proposal number** | Globally unique, monotonically increasing identifier for a Paxos round. Typically encoded as `(seq << bits) | node_id`. |
+| **Commit index** | In Raft, the highest log index known to be committed (replicated to a majority). |
+| **Dueling proposers** | Livelock in Paxos where two proposers repeatedly invalidate each other's prepare phase. |
+| **Election restriction** | Raft rule: a node only votes for a candidate whose log is at least as up-to-date as the voter's. Ensures Leader Completeness. |
+| **Epoch / Term** | Monotonically increasing integer identifying a leadership tenure. Lamport calls it epoch; Raft calls it term; ZAB calls it epoch. |
+| **External consistency** | Property where transactions appear to execute in real-time order globally. Stronger than linearizability for multi-partition systems. Used by Spanner. |
+| **FLP** | Fischer-Lynch-Paterson (1985). Proved no deterministic consensus algorithm works in an asynchronous system if one process may crash. |
+| **fsync** | System call forcing OS buffer cache to disk. Mandatory for Raft's durability guarantee — never skip. |
+| **HLC** | Hybrid Logical Clock: `(physical_time, logical_counter)`. Provides causality tracking while staying close to wall-clock time. |
+| **Joint consensus** | Raft membership change approach using a transitional config that requires majorities from both old and new configs. |
+| **Learner** | Paxos role that receives the chosen value but does not vote. In Raft, learners are read-only replicas added before becoming full voters. |
+| **Linearizability** | Strongest consistency model: every operation appears to execute atomically at some point between invocation and response, consistent with real-time order. |
+| **Log compaction** | Replacing a prefix of the Raft log with a snapshot to bound log size. |
+| **Log Matching Property** | Raft invariant: if two logs share an entry at `(index, term)`, all preceding entries are identical. |
+| **Pacemaker** | HotStuff component responsible for leader rotation and liveness. Equivalent to Raft's election timeout mechanism. |
+| **Pre-vote** | Raft extension where a node solicits hypothetical votes before actually starting an election, preventing term inflation from partitioned nodes. |
+| **Quorum certificate (QC)** | HotStuff/Tendermint term for a threshold signature aggregating $2f+1$ votes. Compact proof that a quorum agreed. |
+| **Read index** | etcd's approach to linearizable reads: record `commitIndex`, confirm leadership via heartbeat, serve read once `applyIndex >= savedCommitIndex`. |
+| **Safety property** | A property violated by a finite execution prefix. "Nothing bad ever happens." |
+| **Split-brain** | Scenario where two partitioned subsets each believe they are the primary. Raft prevents this by requiring majority quorums. |
+| **State machine replication** | Running identical deterministic state machines on multiple nodes, all receiving the same sequence of commands via consensus. |
+| **TrueTime** | Google Spanner's API providing `[earliest, latest]` wall-clock bounds, implemented with GPS + atomic clocks. Enables external consistency. |
+| **Two Generals** | Impossibility result: two processes cannot achieve guaranteed agreement over an unreliable channel in finite time. |
+| **Vector clock** | Per-node integer counters tracking causality: `vc[i]` = number of events node $i$ knows about. Used to detect concurrent vs. causally ordered events. |
+| **View / View change** | PBFT term for the equivalent of Raft's leader epoch + leader election. |
+| **Zxid** | ZooKeeper transaction ID: `(epoch, counter)`. Provides total ordering of all writes across leader changes. |
+
+---
+
 ## Summary and Further Reading
 
 Distributed consensus is not a solved problem in practice. The theory (FLP, quorum intersection, Leader Completeness) is tight and beautiful. The engineering gaps are where systems actually fail: missed fsyncs, clock skew under lease reads, term inflation in partitioned networks, membership change bugs.
