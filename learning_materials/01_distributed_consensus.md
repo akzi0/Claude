@@ -2835,20 +2835,112 @@ Raft provides **linearizability** for individual key reads/writes (when using re
 
 ---
 
+## 15. Research Frontiers (2019–2025)
+
+### Shoal and Shoal++ (Meta, 2023)
+
+DAG-based BFT consensus. Instead of a linear chain of blocks, validators build a Directed Acyclic Graph of proposals. Each vertex includes 2f+1 references to previous vertices, forming an implicit quorum certificate without explicit voting rounds. Shoal++ achieves sub-second latency at 50 validators by pipelining DAG construction with consensus rounds. Used in Meta's Diem successor and academic follow-ons.
+
+### Mysticeti (Mysten Labs / Sui, 2023)
+
+Uncertified DAG consensus with parallel commitment. Mysticeti eliminates the explicit certificate step by having validators commit vertices when they observe 2f+1 votes in the DAG structure itself. This reduces latency by ~40% vs. certified DAG protocols. Production deployed in the Sui blockchain.
+
+### Twins Testing (Distributed Systems Testing, 2021)
+
+An alternative to Jepsen that runs protocol testing without a real network. Each node is "twinned" — run twice with different message schedules — to systematically explore message orderings. The LibraBFT team used Twins to find bugs in HotStuff view-change that Jepsen did not catch, because Twins can explore orderings that are statistically rare even under random fault injection.
+
+### Scalog and Compartmentalized Paxos (NSDI 2020–2021)
+
+**Scalog** decouples ordering from consensus: a separate ordering layer (a gossip protocol) determines the global order of records, and consensus is used only to agree on epoch boundaries. This allows the ordering throughput to scale with the number of replicas rather than being bottlenecked by the Paxos leader.
+
+**Compartmentalized MultiPaxos** parallelizes the Paxos bottleneck by separating: proposers (who assign slots), acceptors (who vote), and a separate "proxy leader" layer. This achieves near-linear throughput scaling by eliminating the leader bottleneck while preserving safety.
+
+### Hotstuff-2 and Linear BFT (2023)
+
+Jolteon (VMware Research) and Hotstuff-2 achieve BFT consensus in 2 phases (vs. 3 in original HotStuff) by leveraging a stronger signature scheme (threshold BLS) and a Pacemaker that provides stricter view synchrony. This further reduces commit latency by 33%.
+
+### Dissecting Performance of BFT (2022)
+
+Arun et al. ("Dissecting BFT Consensus: In Trusted Components We Trust") show that BFT systems with a Trusted Execution Environment (TEE, e.g., Intel SGX) can tolerate $f$ faults with only $2f+1$ replicas (same as crash-fault-tolerant systems) because the TEE prevents Byzantine behavior. This is BFT "for free" given hardware trust assumptions.
+
+---
+
 ## Summary and Further Reading
 
-Distributed consensus is not a solved problem in practice. The theory (FLP, quorum intersection, Leader Completeness) is tight and beautiful. The engineering gaps are where systems actually fail: missed fsyncs, clock skew under lease reads, term inflation in partitioned networks, membership change bugs.
+Distributed consensus is not a solved problem in practice. The theory — FLP impossibility, quorum intersection, Leader Completeness — is tight and beautiful. The engineering gaps are where systems actually fail: missed fsyncs, clock skew under lease reads, term inflation from partitioned nodes, membership change races, no-op timing, and snapshot installation races.
 
-**Essential reading:**
+The progression from theory to production looks like this:
 
-- Lamport, L. (1998). "The Part-Time Parliament." *ACM TOCS 16(2).*
-- Lamport, L. (2001). "Paxos Made Simple." *ACM SIGACT News.*
-- Fischer, M.J., Lynch, N.A., Paterson, M.S. (1985). "Impossibility of Distributed Consensus with One Faulty Process." *JACM 32(2).*
-- Ongaro, D. & Ousterhout, J. (2014). "In Search of an Understandable Consensus Algorithm." *USENIX ATC.*
-- Chandra, T., Griesemer, R., Redstone, J. (2007). "Paxos Made Live." *PODC.*
-- Howard, H., Schwarzkopf, M., Madhavapeddy, A., Crowcroft, J. (2016). "Flexible Paxos." *arXiv:1608.06696.*
-- Yin, M., Malkhi, D., Reiter, M.K., Gueta, G.G., Abraham, I. (2019). "HotStuff: BFT Consensus with Linearity and Responsiveness." *PODC.*
-- Buchman, E. (2016). "Tendermint: Byzantine Fault Tolerance in the Age of Blockchains." MSc thesis.
-- Castro, M. & Liskov, B. (1999). "Practical Byzantine Fault Tolerance." *OSDI.*
-- etcd contributors. "etcd: Distributed reliable key-value store." https://etcd.io/docs/current/learning/design-learner/
-- Ongaro, D. (2014). "Consensus: Bridging Theory and Practice." PhD dissertation, Stanford.
+```
+FLP Impossibility
+    ↓ (partial synchrony assumption)
+Paxos / Raft (CFT)
+    ↓ (adversarial nodes assumption)
+PBFT / HotStuff / Tendermint (BFT)
+    ↓ (scale assumption)
+Multi-Raft / Compartmentalized Paxos / DAG-BFT
+    ↓ (global consistency assumption)
+Spanner TrueTime / HLC-based cross-shard transactions
+    ↓ (verification requirement)
+TLA+ model checking / Verdi Coq proofs / Jepsen testing
+```
+
+Each layer adds complexity and addresses a constraint that the previous layer assumed away. A production distributed database (CockroachDB, Spanner, TiDB) implements all layers simultaneously.
+
+---
+
+## Annotated Bibliography
+
+**Foundational Theory**
+
+- **Fischer, M.J., Lynch, N.A., Paterson, M.S. (1985).** "Impossibility of Distributed Consensus with One Faulty Process." *JACM 32(2), 374–382.* The FLP theorem. Read the original — it is 9 pages and surprisingly accessible. The bivalency argument in §3 is the key.
+
+- **Lamport, L. (1978).** "Time, Clocks, and the Ordering of Events in a Distributed System." *CACM 21(7).* Defines happened-before and Lamport clocks. The foundation of causal consistency.
+
+- **Dwork, C., Lynch, N., Stockmeyer, L. (1988).** "Consensus in the presence of partial synchrony." *JACM 35(2).* Defines the partial synchrony model that Paxos and Raft operate in. Defines GST (Global Stabilization Time). Required reading to understand *why* Raft can guarantee liveness even though FLP says you can't.
+
+- **Chandra, T. & Toueg, S. (1996).** "Unreliable Failure Detectors for Reliable Distributed Systems." *JACM 43(2).* Introduces the failure detector abstraction. The weakest failure detector sufficient for consensus is $\Diamond W$. This is the theoretical justification for leader leases.
+
+**Paxos**
+
+- **Lamport, L. (1998).** "The Part-Time Parliament." *ACM TOCS 16(2).* The original Paxos paper, submitted in 1989, rejected, finally published in 1998. Reads like a description of a Greek parliament. The actual algorithm is in §2.
+
+- **Lamport, L. (2001).** "Paxos Made Simple." *ACM SIGACT News 32(4).* Two-page distillation of Paxos. This is the canonical reference everyone cites. The multi-Paxos extension is in §3.
+
+- **Chandra, T., Griesemer, R., Redstone, J. (2007).** "Paxos Made Live: An Engineering Perspective." *PODC.* How Google built Chubby on Paxos. Lists 15 engineering challenges not in Lamport's paper. The most important systems paper on Paxos.
+
+- **Howard, H., Schwarzkopf, M., Madhavapeddy, A., Crowcroft, J. (2016).** "Flexible Paxos: Quorum Intersection Revisited." *arXiv:1608.06696.* Proves that Phase 1 and Phase 2 quorums only need to intersect each other — opens up asymmetric configurations for geo-distributed systems.
+
+**Raft**
+
+- **Ongaro, D. & Ousterhout, J. (2014).** "In Search of an Understandable Consensus Algorithm (Extended Version)." *USENIX ATC.* The Raft paper. The extended version (available at raft.github.io) has more detail on membership changes and the no-op entry.
+
+- **Ongaro, D. (2014).** "Consensus: Bridging Theory and Practice." *PhD dissertation, Stanford.* The authoritative reference. Chapters 6 (membership changes), 7 (log compaction), and 9 (performance and extensions including pre-vote) are especially important for implementors.
+
+**Byzantine Fault Tolerance**
+
+- **Castro, M. & Liskov, B. (1999).** "Practical Byzantine Fault Tolerance." *OSDI.* The first BFT protocol suitable for real systems. O(n²) complexity is the price; the paper shows it can handle 1000s of req/s. The view-change protocol in §4.4 is complex but crucial.
+
+- **Yin, M., Malkhi, D., Reiter, M.K., Gueta, G.G., Abraham, I. (2019).** "HotStuff: BFT Consensus with Linearity and Responsiveness." *PODC.* Linear communication via threshold signatures. The protocol description in §5 is self-contained. Used in Diem (Facebook's blockchain) as LibraBFT.
+
+- **Buchman, E. (2016).** "Tendermint: Byzantine Fault Tolerance in the Age of Blockchains." *MSc thesis, University of Guelph.* Tendermint's design. The lock mechanism in §3.3 is the key to understanding why validators can safely precommit.
+
+**Production Systems**
+
+- **Corbett, J. et al. (2012).** "Spanner: Google's Globally Distributed Database." *OSDI.* TrueTime, external consistency, and globally distributed Paxos groups. §3 (TrueTime) and §4.1.2 (RW transactions) are the core.
+
+- **Huang, J. et al. (2020).** "TiDB: A Raft-based HTAP Database." *VLDB.* How TiDB combines multi-Raft for OLTP with a columnar store (TiFlash) for OLAP, using Raft learner replicas to async-replicate to the analytical engine.
+
+- **etcd contributors.** "etcd v3 Architecture." *etcd.io/docs.* The v3 design (gRPC, MVCC, leases, watches) is well-documented. The "learning" section explains why learner nodes were added (§ "Design" in etcd docs).
+
+**Formal Verification**
+
+- **Wilcox, J.R. et al. (2015).** "Verdi: A Framework for Implementing and Formally Verifying Distributed Systems." *PLDI.* The Coq framework for verified distributed systems. The raft-verified artifact includes ~10k lines of Coq proofs.
+
+- **Lamport, L. (2002).** "Specifying Systems: The TLA+ Language and Tools for Hardware and Software Engineers." *Addison-Wesley.* The TLA+ book. Chapters 1–8 cover enough to write and check a Raft specification.
+
+**Testing**
+
+- **Kingsbury, K. (2013–present).** "Jepsen: Distributed systems safety research." *jepsen.io.* Analysis reports for etcd, MongoDB, CockroachDB, Cassandra, and 30+ other systems. Each report is a case study in finding real bugs. The etcd report (2014) is the most relevant to Raft.
+
+- **Losa, G. et al. (2021).** "Twins: BFT Systems Made Robust." *DISC.* The Twins testing methodology that found HotStuff view-change bugs. A good complement to Jepsen for protocol-level testing.
