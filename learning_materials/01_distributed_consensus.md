@@ -1068,13 +1068,269 @@ Three-phase pipeline (Prepare, Pre-commit, Commit) with a Pacemaker for leader r
 
 **Safety** relies on the two-chain rule: a block is safe to commit when it extends a two-chain of QCs (grandparent and parent both certified).
 
+### Python: Simplified PBFT State Machine
+
+The following implements PBFT's three-phase protocol for a single request, with view-change logic omitted for clarity. It demonstrates why $O(n^2)$ message complexity arises and how the prepare/commit certificates are formed.
+
+```python
+import hashlib
+import json
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set, Tuple
+
+@dataclass(frozen=True)
+class PBFTMessage:
+    phase: str         # 'PRE-PREPARE', 'PREPARE', 'COMMIT'
+    view: int
+    seq: int
+    digest: str        # hash of request
+    sender: int
+
+class PBFTReplica:
+    def __init__(self, replica_id: int, n_replicas: int):
+        self.id = replica_id
+        self.n = n_replicas
+        self.f = (n_replicas - 1) // 3  # max Byzantine faults
+        self.view = 0
+        self.seq = 0
+
+        # Message log: (phase, view, seq, digest) -> set of senders
+        self.msg_log: Dict[Tuple, Set[int]] = defaultdict(set)
+        # Requests we have executed
+        self.executed: Set[str] = set()
+        # The actual request payloads indexed by digest
+        self.requests: Dict[str, str] = {}
+
+    @property
+    def is_primary(self) -> bool:
+        return self.id == self.view % self.n
+
+    def _digest(self, request: str) -> str:
+        return hashlib.sha256(request.encode()).hexdigest()[:16]
+
+    def handle_client_request(self, request: str) -> List[PBFTMessage]:
+        """Primary only. Assign seq number and broadcast PRE-PREPARE."""
+        assert self.is_primary, "Non-primary received client request directly"
+        self.seq += 1
+        d = self._digest(request)
+        self.requests[d] = request
+        msg = PBFTMessage('PRE-PREPARE', self.view, self.seq, d, self.id)
+        print(f"[Replica {self.id}] Sending PRE-PREPARE(v={self.view}, "
+              f"n={self.seq}, d={d[:8]})")
+        return [msg]  # broadcast to all replicas
+
+    def handle_message(self, msg: PBFTMessage,
+                        request: Optional[str] = None) -> List[PBFTMessage]:
+        """
+        Process an incoming PBFT message. Returns messages to broadcast.
+        """
+        outgoing: List[PBFTMessage] = []
+
+        if msg.phase == 'PRE-PREPARE':
+            if msg.view != self.view:
+                return []
+            if request:
+                self.requests[msg.digest] = request
+            # Non-primary: accept pre-prepare, broadcast PREPARE
+            key = (msg.phase, msg.view, msg.seq, msg.digest)
+            self.msg_log[key].add(msg.sender)
+            prepare = PBFTMessage('PREPARE', self.view, msg.seq, msg.digest, self.id)
+            outgoing.append(prepare)
+            print(f"[Replica {self.id}] Sending PREPARE(v={msg.view}, "
+                  f"n={msg.seq}, d={msg.digest[:8]})")
+
+        elif msg.phase == 'PREPARE':
+            key = (msg.phase, msg.view, msg.seq, msg.digest)
+            self.msg_log[key].add(msg.sender)
+            # Prepared certificate: 2f matching PREPAREs
+            if len(self.msg_log[key]) >= 2 * self.f:
+                commit_key = ('PREPARE_CERT', msg.view, msg.seq, msg.digest)
+                if commit_key not in self.msg_log or not self.msg_log[commit_key]:
+                    self.msg_log[commit_key].add(self.id)  # mark as prepared
+                    commit = PBFTMessage('COMMIT', self.view, msg.seq,
+                                         msg.digest, self.id)
+                    outgoing.append(commit)
+                    print(f"[Replica {self.id}] Prepared! Sending COMMIT("
+                          f"v={msg.view}, n={msg.seq}, d={msg.digest[:8]})")
+
+        elif msg.phase == 'COMMIT':
+            key = (msg.phase, msg.view, msg.seq, msg.digest)
+            self.msg_log[key].add(msg.sender)
+            # Commit certificate: 2f+1 COMMITs
+            if (len(self.msg_log[key]) >= 2 * self.f + 1
+                    and msg.digest not in self.executed):
+                self.executed.add(msg.digest)
+                request_text = self.requests.get(msg.digest, '?')
+                print(f"[Replica {self.id}] COMMITTED request: {request_text!r} "
+                      f"(seq={msg.seq})")
+
+        return outgoing
+
+
+def simulate_pbft():
+    """
+    4 replicas (f=1), one request, no failures.
+    Demonstrates message flow: PRE-PREPARE → PREPARE (x3) → COMMIT (x4).
+    Total messages: 1 + 3 + 4 = O(n^2) = 8 (for n=4).
+    """
+    print("\n" + "="*60)
+    print("PBFT SIMULATION: 4 replicas (f=1)")
+    print("="*60)
+    n = 4
+    replicas = [PBFTReplica(i, n) for i in range(n)]
+    primary = replicas[0]  # view=0, primary=replica 0
+
+    request = "TRANSFER: Alice -> Bob, $100"
+
+    # Primary handles request → PRE-PREPARE
+    pp_msgs = primary.handle_client_request(request)
+    request_digest = pp_msgs[0].digest
+
+    # Broadcast PRE-PREPARE to all non-primaries
+    prepare_msgs = []
+    for replica in replicas[1:]:
+        outgoing = replica.handle_message(pp_msgs[0], request)
+        prepare_msgs.extend(outgoing)
+
+    # All replicas handle all PREPAREs (n-1 PREPAREs each, O(n^2) total)
+    commit_msgs = []
+    for prepare in prepare_msgs:
+        for replica in replicas:
+            if replica.id != prepare.sender:
+                outgoing = replica.handle_message(prepare)
+                commit_msgs.extend(outgoing)
+
+    # All replicas handle all COMMITs
+    for commit in commit_msgs:
+        for replica in replicas:
+            if replica.id != commit.sender:
+                replica.handle_message(commit)
+
+    print(f"\nTotal PREPARE messages: {len(prepare_msgs)}")
+    print(f"Total COMMIT messages:  {len(commit_msgs)}")
+    print(f"All replicas committed: "
+          f"{all(request_digest in r.executed for r in replicas)}")
+
+
+if __name__ == '__main__':
+    simulate_pbft()
+```
+
+**Why O(n²).** Each of the $n$ replicas broadcasts PREPARE to all $n$ replicas: $n(n-1)$ messages. Then each broadcasts COMMIT: another $n(n-1)$. Total is $O(n^2)$. For $n=100$ replicas, that is ~10,000 messages per request — this is why PBFT is impractical beyond ~20 nodes.
+
+### HotStuff: O(n) via Threshold Signatures
+
+HotStuff's key insight: instead of each replica broadcasting its vote to all others (O(n²)), all replicas send their vote (a BLS partial signature) to the **leader only**. The leader aggregates $2f+1$ partial signatures into a single **Quorum Certificate (QC)** of constant size, then broadcasts this single QC to all replicas (O(n) total).
+
+```python
+# Pseudocode for HotStuff QC chaining (conceptual — real BLS crypto omitted)
+
+@dataclass
+class Block:
+    height: int
+    parent_qc: Optional['QuorumCert']  # QC for the parent block
+    payload: str
+
+@dataclass
+class QuorumCert:
+    block_height: int
+    combined_signature: bytes  # aggregated from 2f+1 partial sigs
+    signers: List[int]
+
+class HotStuffReplica:
+    """
+    HotStuff uses a 3-chain commit rule:
+    A block B is SAFE to vote on if:
+      - B extends the highest QC known (locks)
+    A block B is COMMITTED when:
+      - B has a QC (b.qc exists)
+      - B's parent has a QC (b.parent_qc)
+      - B's grandparent has a QC (b.parent_qc.block has a parent_qc)
+    i.e., when there is a chain of 3 consecutive certified blocks.
+    This 3-chain rule gives HotStuff its linear communication — 
+    compared to PBFT's 2-phase (prepare+commit), HotStuff adds one 
+    extra round but eliminates the quadratic broadcast.
+    """
+    def __init__(self, replica_id: int, n: int):
+        self.id = replica_id
+        self.f = (n - 1) // 3
+        self.locked_qc: Optional[QuorumCert] = None  # highest known QC
+        self.committed_height: int = -1
+
+    def safe_to_vote(self, block: Block) -> bool:
+        """Liveness rule: vote if block extends our locked QC or is higher."""
+        if self.locked_qc is None:
+            return True
+        return (block.parent_qc is not None and
+                block.parent_qc.block_height >= self.locked_qc.block_height)
+
+    def on_receive_qc(self, qc: QuorumCert, block: Block,
+                       grandparent_block: Optional[Block]):
+        """Update lock and check for commit."""
+        if self.locked_qc is None or qc.block_height > self.locked_qc.block_height:
+            self.locked_qc = qc
+
+        # Commit rule: three consecutive QC'd blocks
+        if (grandparent_block is not None
+                and grandparent_block.height == block.height - 2
+                and block.parent_qc is not None
+                and grandparent_block.height == block.parent_qc.block_height - 1):
+            if grandparent_block.height > self.committed_height:
+                self.committed_height = grandparent_block.height
+                print(f"Replica {self.id}: Committed block at height "
+                      f"{grandparent_block.height}: {grandparent_block.payload!r}")
+```
+
 ### Tendermint (Buchman et al. 2016, used in Cosmos)
 
 Tendermint is a BFT consensus protocol with **fast finality** — once a block is committed, it is permanent (no forks, unlike Nakamoto consensus).
 
 Protocol: each height has rounds. In each round, the proposer broadcasts a block. Validators go through `PROPOSE → PREVOTE → PRECOMMIT`. Committing requires $2f+1$ precommits (a **commit certificate**). If no commit, move to next round.
 
-**Accountability.** Unlike Raft, Tendermint can cryptographically identify Byzantine validators (equivocation proofs), enabling slashing in proof-of-stake systems.
+**Round timeout.** Tendermint is **partially synchronous**: the timeout for each round starts small and doubles on failure, ensuring eventual termination when the network stabilizes.
+
+**Lock mechanism.** A validator locks on a value when it sees $2f+1$ prevotes for it. Locked validators only prevote for the value they're locked on, or a newer value with a valid unlock proof. This prevents equivocation.
+
+**Accountability.** Unlike Raft, Tendermint can cryptographically identify Byzantine validators (equivocation proofs), enabling slashing in proof-of-stake systems. If a validator signs two conflicting prevotes for the same height and round, both signatures serve as proof of misbehavior.
+
+```python
+from enum import Enum
+
+class TendermintStep(Enum):
+    PROPOSE = 'propose'
+    PREVOTE = 'prevote'
+    PRECOMMIT = 'precommit'
+
+@dataclass
+class TendermintState:
+    """Per-height, per-round state for a Tendermint validator."""
+    height: int
+    round: int = 0
+    step: TendermintStep = TendermintStep.PROPOSE
+    locked_value: Optional[str] = None
+    locked_round: int = -1
+    valid_value: Optional[str] = None   # highest prevoted value
+    valid_round: int = -1
+    prevotes: Dict[int, Dict[str, int]] = field(default_factory=dict)   # round -> value -> count
+    precommits: Dict[int, Dict[str, int]] = field(default_factory=dict) # round -> value -> count
+
+    def add_prevote(self, rnd: int, value: str, f: int) -> Optional[str]:
+        """Returns value if 2f+1 prevotes reached."""
+        self.prevotes.setdefault(rnd, {}).setdefault(value, 0)
+        self.prevotes[rnd][value] += 1
+        if self.prevotes[rnd][value] >= 2 * f + 1:
+            return value
+        return None
+
+    def add_precommit(self, rnd: int, value: str, f: int) -> Optional[str]:
+        """Returns value if 2f+1 precommits reached (block committed)."""
+        self.precommits.setdefault(rnd, {}).setdefault(value, 0)
+        self.precommits[rnd][value] += 1
+        if self.precommits[rnd][value] >= 2 * f + 1:
+            return value
+        return None
+```
 
 ---
 
