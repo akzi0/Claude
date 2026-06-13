@@ -5,6 +5,38 @@
 
 ---
 
+## Table of Contents
+
+1. [Why Consensus Is Hard](#1-why-consensus-is-hard)
+   - Two Generals Problem
+   - FLP Impossibility
+   - Safety vs. Liveness / CAP
+2. [Paxos from First Principles](#2-paxos-from-first-principles)
+   - Roles, Quorum Intersection
+   - Phase 1 & 2 Protocol
+   - Safety Invariant Proof
+   - Multi-Paxos
+   - Python Single-Decree Paxos Implementation
+3. [Raft](#3-raft)
+   - Log Structure & Election
+   - Log Replication & Log Matching
+   - Commitment Rule & Figure 8
+   - Leader Completeness
+   - Cluster Membership Changes
+4. [Python Implementation — Simplified Raft](#4-python-implementation--simplified-raft)
+5. [Byzantine Fault Tolerance](#5-byzantine-fault-tolerance)
+   - PBFT, HotStuff, Tendermint
+6. [What Textbooks Don't Tell You](#6-what-textbooks-dont-tell-you)
+7. [Edge Cases & Failure Modes](#7-edge-cases--failure-modes)
+8. [Hard Exercise](#8-hard-exercise-trace-through-a-complex-partition)
+9. [Consistency Models Deep Dive](#9-consistency-models-deep-dive)
+10. [Consensus in Production Systems](#10-consensus-in-production-systems)
+11. [Multi-Raft and Sharding](#11-multi-raft-and-sharding)
+12. [Performance & Optimization](#12-performance--optimization)
+13. [Glossary](#13-glossary)
+
+---
+
 ## 1. Why Consensus Is Hard
 
 Consensus — the problem of getting a set of processes to agree on a single value — appears deceptively simple. It is not. Three foundational impossibility results bound what is achievable, and engineers who do not internalize them build systems that fail in the field in confusing ways.
@@ -164,6 +196,141 @@ Single-decree Paxos agrees on one value. Multi-Paxos extends it to an ordered lo
 Chandra et al. (2007) "Paxos Made Live" describes Google's production implementation (Chubby) and lists the significant engineering challenges: multi-master read, snapshot/GC, epoch changes, lease management. The gap between "Paxos the algorithm" and "Paxos the system" is enormous.
 
 **Dueling proposers and liveness.** Two proposers can livelock: Proposer A prepares ballot 1, B prepares ballot 2 (invalidating A), A prepares ballot 3 (invalidating B), ad infinitum. Solution: randomized backoff or a single stable leader with a lease.
+
+### Python: Single-Decree Paxos
+
+```python
+import threading
+import random
+import time
+from dataclasses import dataclass, field
+from typing import Optional, Dict, List, Tuple
+
+@dataclass
+class Promise:
+    promised_ballot: int
+    accepted_ballot: Optional[int]
+    accepted_value: Optional[str]
+
+@dataclass
+class AcceptorState:
+    highest_promised: int = -1
+    accepted_ballot: Optional[int] = None
+    accepted_value: Optional[str] = None
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def prepare(self, ballot: int) -> Optional[Promise]:
+        with self._lock:
+            if ballot > self.highest_promised:
+                self.highest_promised = ballot
+                return Promise(ballot, self.accepted_ballot, self.accepted_value)
+            return None  # Nack
+
+    def accept(self, ballot: int, value: str) -> bool:
+        with self._lock:
+            if ballot >= self.highest_promised:
+                self.highest_promised = ballot
+                self.accepted_ballot = ballot
+                self.accepted_value = value
+                return True
+            return False  # Nack
+
+
+class Proposer:
+    def __init__(self, node_id: int, acceptors: List[AcceptorState]):
+        self.node_id = node_id
+        self.acceptors = acceptors
+        self.seq = 0
+
+    def _make_ballot(self) -> int:
+        # Ballot encoding: (seq << 8) | node_id — globally unique if node_ids unique
+        self.seq += 1
+        return (self.seq << 8) | self.node_id
+
+    def propose(self, value: str) -> Optional[str]:
+        """
+        Run single-decree Paxos. Returns the chosen value (may differ from proposed).
+        Returns None if consensus could not be reached (quorum unavailable).
+        """
+        quorum = len(self.acceptors) // 2 + 1
+
+        # Phase 1: Prepare
+        ballot = self._make_ballot()
+        promises: List[Promise] = []
+        for acceptor in self.acceptors:
+            result = acceptor.prepare(ballot)
+            if result is not None:
+                promises.append(result)
+
+        if len(promises) < quorum:
+            return None  # Could not get quorum of promises
+
+        # Determine value to propose (highest previously accepted, or our own)
+        highest_ballot = -1
+        chosen_value = value
+        for p in promises:
+            if p.accepted_ballot is not None and p.accepted_ballot > highest_ballot:
+                highest_ballot = p.accepted_ballot
+                chosen_value = p.accepted_value
+
+        # Phase 2: Accept
+        accepted_count = 0
+        for acceptor in self.acceptors:
+            if acceptor.accept(ballot, chosen_value):
+                accepted_count += 1
+
+        if accepted_count >= quorum:
+            return chosen_value  # chosen_value is now the consensus decision
+        return None
+
+
+def demonstrate_paxos():
+    """
+    Three acceptors, two competing proposers.
+    Shows that despite competition, the safety invariant holds:
+    once a value is chosen, all subsequent proposals converge to it.
+    """
+    print("\n=== Single-Decree Paxos Demonstration ===\n")
+    acceptors = [AcceptorState() for _ in range(3)]
+
+    p1 = Proposer(node_id=1, acceptors=acceptors)
+    p2 = Proposer(node_id=2, acceptors=acceptors)
+
+    # Proposer 1 runs Phase 1 with ballot (1<<8)|1 = 257
+    # Proposer 2 runs Phase 1 with ballot (1<<8)|2 = 258 (higher, wins)
+    # P1 gets promises but P2 invalidates them before P1 reaches Phase 2.
+    # To simulate: P1 does prepare, then P2 does full propose, then P1 tries accept.
+
+    # Step 1: P1 gets promises
+    ballot_p1 = p1._make_ballot()  # 257
+    promises_p1 = [a.prepare(ballot_p1) for a in acceptors]
+    print(f"P1 prepared ballot {ballot_p1}, got {sum(1 for p in promises_p1 if p)} promises")
+
+    # Step 2: P2 runs a full round (higher ballot, wins)
+    result_p2 = p2.propose("value_from_P2")
+    print(f"P2 proposed 'value_from_P2', result: {result_p2}")
+
+    # Step 3: P1 tries Phase 2 with its stale ballot — rejected
+    accepted_p1 = sum(1 for a in acceptors if a.accept(ballot_p1, "value_from_P1"))
+    quorum = len(acceptors) // 2 + 1
+    print(f"P1 tried accept with stale ballot {ballot_p1}: {accepted_p1}/{len(acceptors)} accepted (need {quorum})")
+    print(f"P1 succeeded: {accepted_p1 >= quorum}")
+
+    # Step 4: P1 retries with new ballot — must pick up P2's value
+    result_p1_retry = p1.propose("value_from_P1")
+    print(f"P1 retry result: {result_p1_retry}  (must equal P2's value if P2 committed)")
+
+    print("\nFinal acceptor states:")
+    for i, a in enumerate(acceptors):
+        print(f"  Acceptor {i}: highest_promised={a.highest_promised}, "
+              f"accepted=({a.accepted_ballot}, {a.accepted_value!r})")
+
+
+if __name__ == '__main__':
+    demonstrate_paxos()
+```
+
+**Key observation.** In `demonstrate_paxos()`, P1's retry will return `'value_from_P2'` — not `'value_from_P1'`. This is the safety invariant in action: P2's value was accepted by a quorum, so any subsequent proposer that runs Phase 1 will see it in the promises and is forced to adopt it. The protocol is self-healing.
 
 ---
 
