@@ -1844,7 +1844,192 @@ This is the design working as intended: committed entries are durable across lea
 
 ---
 
-## 9. Testing Distributed Consensus
+## 9. Formal Verification of Consensus Protocols
+
+Informal proofs of distributed algorithms are notoriously error-prone. Lamport's original Paxos paper had a subtle bug in the liveness argument. The formal verification community has developed tools that find these bugs mechanically.
+
+### TLA+ (Temporal Logic of Actions)
+
+TLA+ is a specification language for concurrent and distributed systems. It describes systems as state machines and verifies properties using model checking (TLC) or theorem proving (TLAPS).
+
+**Raft's TLA+ specification** (written by Diego Ongaro, available at https://github.com/ongardie/raft.tla) encodes all node states and transitions. The model checker exhaustively explores all possible orderings of messages up to a small bound (typically 3–5 nodes, up to 4 terms).
+
+**Key properties verified in Raft.tla:**
+
+```tla
+(* Election Safety: at most one leader per term *)
+ElectionSafety ==
+    \A i, j \in Server :
+        (/\ state[i] = Leader
+         /\ state[j] = Leader
+         /\ currentTerm[i] = currentTerm[j])
+        => i = j
+
+(* Leader Completeness: committed entries appear in future leaders *)
+LeaderCompleteness ==
+    \A i \in Server :
+        state[i] = Leader =>
+            \A v \in committed :
+                v.term <= currentTerm[i] =>
+                    \E idx \in DOMAIN log[i] :
+                        /\ log[i][idx].term = v.term
+                        /\ log[i][idx].cmd  = v.cmd
+
+(* Log Matching: same (index, term) implies same prefix *)
+LogMatching ==
+    \A i, j \in Server :
+        \A n \in DOMAIN log[i] :
+            n \in DOMAIN log[j] =>
+                log[i][n].term = log[j][n].term =>
+                    SubSeq(log[i], 1, n) = SubSeq(log[j], 1, n)
+
+(* State Machine Safety: applied values are identical across nodes *)
+StateMachineSafety ==
+    \A i, j \in Server :
+        \A n \in 1..commitIndex[i] :
+            n \in 1..commitIndex[j] =>
+                log[i][n] = log[j][n]
+```
+
+The TLC model checker for a 3-node Raft cluster with 3 terms explores approximately 10 million states. Running `tlc Raft.tla -config Raft.cfg` takes ~30 minutes on a modern laptop and produces a counterexample if any invariant is violated.
+
+### Python-Encoded Invariant Checking
+
+We can run lightweight invariant checks on our Python simulation at each step:
+
+```python
+class ConsensusInvariantChecker:
+    """
+    Runtime invariant checker. Attach to a cluster and call check()
+    at each simulation step to catch violations immediately.
+    
+    These match the TLA+ invariants above, translated to Python.
+    """
+    def __init__(self, nodes: List[RaftNode]):
+        self.nodes = nodes
+        self.violations: List[str] = []
+
+    def check(self) -> bool:
+        """Returns True if all invariants hold, False otherwise."""
+        ok = True
+        ok &= self._check_election_safety()
+        ok &= self._check_log_matching()
+        ok &= self._check_commit_monotonicity()
+        return ok
+
+    def _check_election_safety(self) -> bool:
+        """At most one leader per term."""
+        leaders_by_term: Dict[int, List[int]] = {}
+        for node in self.nodes:
+            s = node.status()
+            if s['state'] == 'leader':
+                t = s['term']
+                leaders_by_term.setdefault(t, []).append(s['node_id'])
+
+        ok = True
+        for term, leaders in leaders_by_term.items():
+            if len(leaders) > 1:
+                msg = (f"ELECTION SAFETY VIOLATION: "
+                       f"Multiple leaders in term {term}: {leaders}")
+                self.violations.append(msg)
+                print(f"*** {msg} ***")
+                ok = False
+        return ok
+
+    def _check_log_matching(self) -> bool:
+        """If two nodes have an entry with the same (index, term), prefixes match."""
+        ok = True
+        statuses = [n.status() for n in self.nodes]
+        for i in range(len(statuses)):
+            for j in range(i + 1, len(statuses)):
+                log_i = statuses[i]['log']
+                log_j = statuses[j]['log']
+                min_len = min(len(log_i), len(log_j))
+                for idx in range(min_len):
+                    if log_i[idx].term == log_j[idx].term:
+                        # Prefixes must match
+                        for k in range(idx + 1):
+                            if log_i[k] != log_j[k]:
+                                msg = (
+                                    f"LOG MATCHING VIOLATION: "
+                                    f"nodes {statuses[i]['node_id']} and "
+                                    f"{statuses[j]['node_id']} agree at "
+                                    f"index={idx} term={log_i[idx].term} "
+                                    f"but differ at index={k}: "
+                                    f"{log_i[k]} vs {log_j[k]}"
+                                )
+                                self.violations.append(msg)
+                                print(f"*** {msg} ***")
+                                ok = False
+        return ok
+
+    def _check_commit_monotonicity(self) -> bool:
+        """Commit index never decreases."""
+        ok = True
+        if not hasattr(self, '_prev_commits'):
+            self._prev_commits = {}
+        for node in self.nodes:
+            s = node.status()
+            nid = s['node_id']
+            ci = s['commit_index']
+            prev = self._prev_commits.get(nid, -1)
+            if ci < prev:
+                msg = (f"COMMIT MONOTONICITY VIOLATION: "
+                       f"node {nid} commit_index went from {prev} to {ci}")
+                self.violations.append(msg)
+                print(f"*** {msg} ***")
+                ok = False
+            self._prev_commits[nid] = ci
+        return ok
+
+    def summary(self):
+        if not self.violations:
+            print("All invariants held throughout simulation.")
+        else:
+            print(f"{len(self.violations)} invariant violation(s) found:")
+            for v in self.violations:
+                print(f"  - {v}")
+
+
+def simulate_with_invariant_checking():
+    """Run the Raft cluster with invariant checking at every step."""
+    nodes: List[RaftNode] = [RaftNode.__new__(RaftNode) for _ in range(5)]
+    for i, node in enumerate(nodes):
+        node.__init__(i, [n for n in nodes if n is not node])
+
+    checker = ConsensusInvariantChecker(nodes)
+
+    # Wait for election, periodically checking invariants
+    for _ in range(50):
+        time.sleep(0.1)
+        checker.check()
+
+    leader = next((n for n in nodes if n.status()['state'] == 'leader'), None)
+    if leader:
+        for cmd in ['SET a=1', 'SET b=2', 'SET c=3']:
+            leader.client_request(cmd)
+            time.sleep(0.05)
+            checker.check()
+
+    time.sleep(0.5)
+    checker.check()
+    checker.summary()
+```
+
+### Coq Proofs of Consensus
+
+The **Verdi** project (University of Washington) provides mechanically verified implementations of distributed systems in Coq. Their `raft-verified` library proves Raft's Log Matching Property and State Machine Safety using the Coq proof assistant.
+
+The key insight from Verdi: proofs about distributed algorithms decompose into:
+1. **Network semantics** (how messages are delivered — the environment)
+2. **Protocol correctness** (invariant preservation across each state transition)
+3. **Composition** (the protocol + environment → property)
+
+This decomposition mirrors how we reason about Raft in this document, but made machine-checkable. The Verdi Raft proof is ~10,000 lines of Coq and took ~2 person-years to complete — which gives you a sense of how non-trivial these proofs are even when the algorithm appears "simple."
+
+---
+
+## 10. Testing Distributed Consensus
 
 Distributed systems are notoriously difficult to test because the bugs live in rare interleavings of concurrent events. Standard unit tests cannot exercise them. This section covers the methodology used to find real bugs in production systems.
 
