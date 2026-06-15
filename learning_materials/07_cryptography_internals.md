@@ -1,5 +1,17 @@
 # Lesson 07: Cryptography Internals — Elliptic Curves, Protocols, and Implementation
 
+---
+> **Navigation** | [← CURRICULUM](../CURRICULUM.md) | [Solutions →](../solutions/07_solution.md)
+>
+> **Prerequisites:** modular arithmetic, basic Python, some number theory helpful
+>
+> **Related Lessons:**
+> - 🔗 Lesson 01 — Distributed Consensus: TLS 1.3 protects Raft RPC channels
+> - 🔗 Lesson 06 — CPU Microarchitecture: Constant-time crypto avoids timing side-channels — connects to branch prediction in CPU architecture
+>
+> **Estimated time:** 4 hours reading + 3 hours exercise (ECC from scratch is involved)
+---
+
 > **Prerequisite level:** Graduate applied cryptography. Assumes familiarity with number theory, group theory, and Python 3.10+. All cryptographic primitives are implemented from scratch using Python integers only—no `cryptography`, `pycryptodome`, or `nacl` imports. We compare our outputs against `hashlib` for hash functions only.
 >
 > **Version:** 1.15 (15 refinement iterations) | **Date:** 2026-06 | **Difficulty:** ★★★★★

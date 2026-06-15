@@ -1,5 +1,17 @@
 # Distributed Consensus: From Impossibility to Production Systems
 
+---
+> **Navigation** | [← CURRICULUM](../CURRICULUM.md) | [Solutions →](../solutions/01_solution.md)
+>
+> **Prerequisites:** networking basics, basic Python, set theory
+>
+> **Related Lessons:**
+> - 🔗 Lesson 02 — Database Internals: Databases use Raft for replication — etcd backs Kubernetes
+> - 🔗 Lesson 07 — Cryptography Internals: TLS 1.3 protects Raft RPC channels
+>
+> **Estimated time:** 3 hours reading + 2 hours exercise
+---
+
 *Graduate Seminar Material — Distributed Systems*
 *References: Lamport (1998, 2001), Ongaro & Ousterhout (2014), Chandra et al. (2007), Fischer, Lynch & Paterson (1985)*
 

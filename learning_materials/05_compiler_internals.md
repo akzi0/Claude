@@ -1,5 +1,17 @@
 # Lesson 05: Compiler Internals — SSA, Optimization Passes, and Register Allocation
 
+---
+> **Navigation** | [← CURRICULUM](../CURRICULUM.md) | [Solutions →](../solutions/05_solution.md)
+>
+> **Prerequisites:** discrete math (graphs, trees), Python, some exposure to assembly
+>
+> **Related Lessons:**
+> - 🔗 Lesson 06 — CPU Microarchitecture: Register allocation targets the exact register file described in CPU microarchitecture
+> - 🔗 Lesson 03 — Memory Models: Compiler `memory_order` maps directly to hardware memory barriers
+>
+> **Estimated time:** 4 hours reading + 3 hours exercise (SSA implementation is significant)
+---
+
 > **Level**: Graduate PL/Compiler Theory  
 > **Prerequisites**: Data structures, algorithms, basic Python, discrete math  
 > **Goal**: Build working implementations of SSA construction, key optimization passes, liveness analysis, and graph-coloring register allocation. Understand what production compilers (LLVM, GCC, V8) actually do internally.

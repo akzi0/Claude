@@ -1,5 +1,18 @@
 # Lesson 02: Database Internals — B+ Trees, LSM Trees, MVCC, and WAL
 
+---
+> **Navigation** | [← CURRICULUM](../CURRICULUM.md) | [Solutions →](../solutions/02_solution.md)
+>
+> **Prerequisites:** OS file I/O basics, basic Python, data structures (trees)
+>
+> **Related Lessons:**
+> - 🔗 Lesson 01 — Distributed Consensus: Raft is used in distributed databases for replication
+> - 🔗 Lesson 04 — OS Virtual Memory: mmap and the page cache underpin database buffer pools
+> - 🔗 Lesson 03 — Memory Models: MVCC uses atomic operations — understanding memory models helps
+>
+> **Estimated time:** 3 hours reading + 2 hours exercise
+---
+
 > **Audience**: Engineers who have used PostgreSQL or MySQL in production but have never read the source code or a storage engine paper. This lesson operates at graduate seminar depth. By the end you will be able to reason about query latency, write amplification, vacuum tuning, and crash recovery from first principles.
 
 ---

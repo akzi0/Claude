@@ -1,5 +1,17 @@
 # Lesson 03: Memory Models & Lock-Free Programming
 
+---
+> **Navigation** | [← CURRICULUM](../CURRICULUM.md) | [Solutions →](../solutions/03_solution.md)
+>
+> **Prerequisites:** basic computer architecture (CPU, RAM), Python threading
+>
+> **Related Lessons:**
+> - 🔗 Lesson 06 — CPU Microarchitecture: Store buffers and MESI are the physical hardware described here abstractly
+> - 🔗 Lesson 04 — OS Virtual Memory: TLB shootdowns use memory barriers; NUMA creates non-uniform memory access patterns discussed here
+>
+> **Estimated time:** 3 hours reading + 2 hours exercise
+---
+
 > **Level**: Senior Systems Programmer / CPU Architect  
 > **Prerequisites**: C/C++ fundamentals, OS threading primitives, cache coherence basics  
 > **Language**: Python (with ctypes, multiprocessing, threading to expose real hardware effects)  

@@ -1,5 +1,18 @@
 # Lesson 06: CPU Microarchitecture — Out-of-Order Execution, Branch Prediction, and Cache Coherence
 
+---
+> **Navigation** | [← CURRICULUM](../CURRICULUM.md) | [Solutions →](../solutions/06_solution.md)
+>
+> **Prerequisites:** Lesson 03 strongly recommended first (store buffers, MESI); binary representation
+>
+> **Related Lessons:**
+> - 🔗 Lesson 03 — Memory Models: This lesson is the hardware reality behind the memory model abstractions
+> - 🔗 Lesson 05 — Compiler Internals: Pipeline hazards drive compiler scheduling decisions
+> - 🔗 Lesson 04 — OS Virtual Memory: Cache hierarchy directly affects TLB and page table walk costs
+>
+> **Estimated time:** 3 hours reading + 2 hours exercise + benchmark runs
+---
+
 > **Target audience:** Engineers who have read Hennessy & Patterson cover to cover and want to go deeper into real hardware. All benchmarks run in Python with `time.perf_counter()` to expose actual hardware effects.
 
 ---

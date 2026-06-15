@@ -1,5 +1,18 @@
 # Lesson 04: OS Internals — Virtual Memory, Page Tables, TLB, and NUMA
 
+---
+> **Navigation** | [← CURRICULUM](../CURRICULUM.md) | [Solutions →](../solutions/04_solution.md)
+>
+> **Prerequisites:** basic OS concepts (processes, files), Python, some C intuition
+>
+> **Related Lessons:**
+> - 🔗 Lesson 03 — Memory Models: NUMA and memory barriers underpin virtual memory behaviour
+> - 🔗 Lesson 06 — CPU Microarchitecture: The TLB is a hardware cache in the same hierarchy as L1/L2/L3
+> - 🔗 Lesson 02 — Database Internals: The page cache and mmap are directly used by database buffer pools
+>
+> **Estimated time:** 3 hours reading + 1.5 hours exercise
+---
+
 > **Level:** Linux kernel source reader. All code samples require Python 3.8+ with `mmap`, `ctypes`, and `os` modules.
 
 ---
